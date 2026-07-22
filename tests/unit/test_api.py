@@ -26,6 +26,9 @@ def sign(body: bytes, secret: str) -> str:
     return "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
 
 
+POOL_LABELS = ["self-hosted", "modal", "acme"]
+
+
 def queued_body(*, labels: list[str] | None = None) -> bytes:
     return json.dumps(
         {
@@ -33,7 +36,7 @@ def queued_body(*, labels: list[str] | None = None) -> bytes:
             "workflow_job": {
                 "id": 42,
                 "run_id": 1,
-                "labels": labels if labels is not None else ["modal"],
+                "labels": labels if labels is not None else list(POOL_LABELS),
             },
             "repository": {"full_name": "acme/api"},
         }
@@ -44,17 +47,29 @@ def cancelled_body(*, job_id: int = 42) -> bytes:
     return json.dumps(
         {
             "action": "cancelled",
-            "workflow_job": {"id": job_id, "run_id": 1, "labels": ["modal"]},
+            "workflow_job": {"id": job_id, "run_id": 1, "labels": list(POOL_LABELS)},
             "repository": {"full_name": "acme/api"},
         }
     ).encode()
 
 
 def mock_runner(*, labels: list[str] | None = None) -> MagicMock:
+    """Unhydrated handle: labels empty until ``hydrate`` loads persisted pool meta."""
+    pool = list(labels) if labels is not None else list(POOL_LABELS)
     runner = MagicMock()
-    runner.meta = RunnerMeta(name="acme", labels=list(labels or []))
+    runner.meta = RunnerMeta(name="acme", labels=[])
     runner.environment_name = None
     runner.client = None
+
+    def hydrate() -> None:
+        runner.meta = RunnerMeta(
+            name="acme",
+            labels=pool,
+            app_name=runner.meta.app_name,
+            server_name=runner.meta.server_name,
+        )
+
+    runner.hydrate.side_effect = hydrate
     return runner
 
 
@@ -221,7 +236,7 @@ def test_github_webhook_204_label_mismatch(monkeypatch: pytest.MonkeyPatch) -> N
         patch.object(DeliveryStore, "__init__", lambda self, name: None),
         patch(
             "runner_modal.runner.Runner.from_name",
-            return_value=mock_runner(labels=["self-hosted", "modal", "acme"]),
+            return_value=mock_runner(labels=POOL_LABELS),
         ),
         patch("runner_modal.runner.Runner.Job.create") as create,
     ):
@@ -231,11 +246,72 @@ def test_github_webhook_204_label_mismatch(monkeypatch: pytest.MonkeyPatch) -> N
         create.assert_not_called()
 
 
+def test_admission_hydrates_before_pool_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: from_name alone leaves labels=[]; hydrate must run first."""
+    monkeypatch.setenv("WEBHOOK_SECRET", "hook")
+    runner = mock_runner(labels=POOL_LABELS)
+    assert runner.meta.labels == []
+
+    with (
+        patch.object(DeliveryStore, "__init__", lambda self, name: None),
+        patch("runner_modal.runner.Runner.from_name", return_value=runner),
+        patch("runner_modal.runner.Runner.Job.create") as create,
+    ):
+        client = TestClient(WebhookApp.for_runner("acme"))
+        # Hosted-style labels must not spawn a Modal runner after hydrate.
+        resp = post_github(client, queued_body(labels=["ubuntu-latest"]))
+        assert resp.status_code == 204
+        runner.hydrate.assert_called()
+        create.assert_not_called()
+
+
+def test_admission_rejects_missing_self_hosted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("WEBHOOK_SECRET", "hook")
+
+    with (
+        patch.object(DeliveryStore, "__init__", lambda self, name: None),
+        patch(
+            "runner_modal.runner.Runner.from_name",
+            return_value=mock_runner(labels=["modal", "acme"]),
+        ),
+        patch("runner_modal.runner.Runner.Job.create") as create,
+    ):
+        client = TestClient(WebhookApp.for_runner("acme"))
+        resp = post_github(client, queued_body(labels=["modal", "acme"]))
+        assert resp.status_code == 204
+        create.assert_not_called()
+
+
+def test_admission_rejects_empty_pool(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("WEBHOOK_SECRET", "hook")
+
+    with (
+        patch.object(DeliveryStore, "__init__", lambda self, name: None),
+        patch(
+            "runner_modal.runner.Runner.from_name",
+            return_value=mock_runner(labels=[]),
+        ),
+        patch("runner_modal.runner.Runner.Job.create") as create,
+    ):
+        client = TestClient(WebhookApp.for_runner("acme"))
+        resp = post_github(client, queued_body(labels=POOL_LABELS))
+        assert resp.status_code == 204
+        create.assert_not_called()
+
+
 def test_github_webhook_cancelled_terminates(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("WEBHOOK_SECRET", "hook")
     job = MagicMock()
     runner = mock_runner()
-    runner.meta = RunnerMeta(name="acme", labels=[], app_name="acme-ci")
+
+    def hydrate() -> None:
+        runner.meta = RunnerMeta(name="acme", labels=POOL_LABELS, app_name="acme-ci")
+
+    runner.hydrate.side_effect = hydrate
 
     with (
         patch.object(DeliveryStore, "__init__", lambda self, name: None),
@@ -257,7 +333,11 @@ def test_github_webhook_cancelled_terminates(monkeypatch: pytest.MonkeyPatch) ->
 def test_github_webhook_cancelled_missing_job(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("WEBHOOK_SECRET", "hook")
     runner = mock_runner()
-    runner.meta = RunnerMeta(name="acme", labels=[], app_name="acme-ci")
+
+    def hydrate() -> None:
+        runner.meta = RunnerMeta(name="acme", labels=POOL_LABELS, app_name="acme-ci")
+
+    runner.hydrate.side_effect = hydrate
 
     with (
         patch.object(DeliveryStore, "__init__", lambda self, name: None),

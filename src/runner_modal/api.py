@@ -229,8 +229,11 @@ class WebhookApp:
             self.terminate_job(runner, event.job_id)
             return Response(status_code=status.HTTP_204_NO_CONTENT)
 
+        runner.hydrate()
         pool = set(runner.meta.labels)
-        if pool and not pool <= set(event.labels):
+        job_labels = set(event.labels)
+        # Require self-hosted + configured pool labels (empty pool admits nothing).
+        if "self-hosted" not in job_labels or not pool or not pool <= job_labels:
             return Response(status_code=status.HTTP_204_NO_CONTENT)
 
         existing = self.deliveries.try_claim(event.delivery_id)
