@@ -4,7 +4,11 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
+.ty_cache/
 dist/
 *.egg-info/
 .DS_Store
 .modal/
+.agents/
+
+skills-lock.json

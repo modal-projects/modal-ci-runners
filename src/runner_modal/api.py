@@ -7,7 +7,8 @@ import hashlib
 import hmac
 import os
 import time
-from typing import Literal, Mapping, Self
+from collections.abc import Mapping
+from typing import Literal, Self
 
 import modal
 from fastapi import FastAPI, HTTPException, Request, Response, status
@@ -36,7 +37,10 @@ class WorkflowJob(BaseModel):
 
 
 class WorkflowJobEvent(BaseModel):
-    """GitHub ``workflow_job`` payload; use ``from_request`` for HMAC + queued filter."""
+    """GitHub ``workflow_job`` payload.
+
+    Use ``from_request`` for HMAC verification and the queued-job filter.
+    """
 
     action: str
     workflow_job: WorkflowJob
@@ -141,9 +145,7 @@ class Deliveries:
         return self.get(delivery_id)
 
     def mark_done(self, delivery_id: str, object_id: str) -> None:
-        record = DeliveryRecord(
-            status="done", ts=time.time(), object_id=object_id
-        )
+        record = DeliveryRecord(status="done", ts=time.time(), object_id=object_id)
         self.store[delivery_id] = record.model_dump(mode="json")
 
     def release(self, delivery_id: str) -> None:
