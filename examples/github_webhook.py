@@ -30,4 +30,5 @@ runner = Runner.create(
     labels=["self-hosted", "modal", "acme"],
     max_concurrent=20,
     cache=True,
+    idle_timeout=900,
 )

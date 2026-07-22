@@ -10,7 +10,7 @@ import pytest
 import runner_modal
 from runner_modal import Runner, RunnerInfo
 from runner_modal.exceptions import AuthError, ConcurrencyLimitError, JobTimeoutError
-from runner_modal.runner import TAG_KIND, TAG_KIND_VALUE, TAG_POOL, JitConfig
+from runner_modal.runner import JOB_KIND, KIND_TAG, POOL_TAG, JitConfig
 
 
 def test_public_exports_match_modal_style_surface() -> None:
@@ -127,8 +127,8 @@ def test_job_create_uses_jit_secret() -> None:
         kwargs = create.call_args.kwargs
         assert jit_secret in kwargs["secrets"]
         assert "MODAL_RUNNER_JIT" not in (kwargs.get("env") or {})
-        assert kwargs["tags"][TAG_KIND] == TAG_KIND_VALUE
-        assert kwargs["tags"][TAG_POOL] == "p"
+        assert kwargs["tags"][KIND_TAG] == JOB_KIND
+        assert kwargs["tags"][POOL_TAG] == "p"
         assert kwargs["cpu"] == 2.0
 
 

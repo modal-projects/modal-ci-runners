@@ -1,4 +1,4 @@
-"""HTTP control plane — FastAPI App, webhook events, deliveries (not exported)."""
+"""HTTP control plane — webhook FastAPI app, events, delivery store (not exported)."""
 
 from __future__ import annotations
 
@@ -17,7 +17,8 @@ from pydantic import BaseModel, Field, ValidationError
 from runner_modal.exceptions import AuthError, ConcurrencyLimitError
 from runner_modal.runner import Runner
 
-DELIVERY_TTL_S = 7 * 24 * 3600
+DELIVERY_TTL_SECONDS = 7 * 24 * 3600
+PENDING_TTL_SECONDS = 15 * 60
 
 
 class DeliveryRecord(BaseModel):
@@ -39,7 +40,7 @@ class WorkflowJob(BaseModel):
 class WorkflowJobEvent(BaseModel):
     """GitHub ``workflow_job`` payload.
 
-    Use ``from_request`` for HMAC verification and the queued-job filter.
+    Use ``from_request`` for HMAC verification. Handler branches on ``action``.
     """
 
     action: str
@@ -85,7 +86,7 @@ class WorkflowJobEvent(BaseModel):
             return None
 
         event = cls.model_validate_json(body)
-        if event.action != "queued":
+        if event.action not in ("queued", "cancelled"):
             return None
 
         delivery = hdrs.get("x-github-delivery") or str(event.workflow_job.id)
@@ -107,11 +108,12 @@ class JobAccepted(BaseModel):
     name: str | None = None
 
 
-class Deliveries:
+class DeliveryStore:
     """Idempotency store for GitHub delivery IDs (Modal Dict).
 
     Claim before side effects: ``try_claim`` → create → ``mark_done``.
     ``trim`` is opportunistic GC — not called on the request hot path.
+    Stale ``pending`` claims are reclaimed lazily in ``try_claim``.
     """
 
     def __init__(self, runner_name: str) -> None:
@@ -133,7 +135,18 @@ class Deliveries:
         """Claim ``delivery_id``. Returns ``None`` if this caller won.
 
         If the key already exists, returns the existing record (done or pending).
+        Stale pending older than ``PENDING_TTL_SECONDS`` are deleted and reclaimed.
         """
+        existing = self.get(delivery_id)
+        if existing is not None:
+            if (
+                existing.status == "pending"
+                and time.time() - existing.ts > PENDING_TTL_SECONDS
+            ):
+                del self.store[delivery_id]
+            else:
+                return existing
+
         pending = DeliveryRecord(status="pending", ts=time.time())
         written = self.store.put(
             delivery_id,
@@ -159,16 +172,16 @@ class Deliveries:
         now = time.time()
         for key in list(self.store.keys()):
             record = self.get(key)
-            if record is not None and now - record.ts > DELIVERY_TTL_S:
+            if record is not None and now - record.ts > DELIVERY_TTL_SECONDS:
                 del self.store[key]
 
 
-class App:
+class WebhookApp:
     """FastAPI control plane for a named Runner (Modal Server mounts this)."""
 
     def __init__(self, runner_name: str) -> None:
         self.runner_name = runner_name
-        self.deliveries = Deliveries(runner_name)
+        self.deliveries = DeliveryStore(runner_name)
         self.fastapi = FastAPI()
         self.fastapi.get("/health", response_model=HealthResponse)(self.health)
         self.fastapi.post(
@@ -191,9 +204,9 @@ class App:
     async def github_webhook(self, request: Request) -> JobAccepted | Response:
         body = await request.body()
         headers = {k: v for k, v in request.headers.items()}
-        return await asyncio.to_thread(self._github_sync, body, headers)
+        return await asyncio.to_thread(self.process_webhook, body, headers)
 
-    def _github_sync(
+    def process_webhook(
         self, body: bytes, headers: dict[str, str]
     ) -> JobAccepted | Response:
         try:
@@ -210,6 +223,16 @@ class App:
         if event is None:
             return Response(status_code=status.HTTP_204_NO_CONTENT)
 
+        runner = Runner.from_name(self.runner_name)
+
+        if event.action == "cancelled":
+            self.terminate_job(runner, event.job_id)
+            return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+        pool = set(runner.meta.labels)
+        if pool and not pool <= set(event.labels):
+            return Response(status_code=status.HTTP_204_NO_CONTENT)
+
         existing = self.deliveries.try_claim(event.delivery_id)
         if existing is not None:
             if existing.status == "done" and existing.object_id:
@@ -219,28 +242,65 @@ class App:
                 detail="delivery in progress",
             )
 
-        runner = Runner.from_name(self.runner_name)
+        job_name = f"job-{event.job_id}"
         try:
             job = Runner.Job.create(
                 runner,
                 repository=event.repo,
                 labels=event.labels,
-                name=f"job-{event.job_id}",
+                name=job_name,
             )
         except ConcurrencyLimitError as e:
             self.deliveries.release(event.delivery_id)
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e)
             ) from e
+        except modal.exception.AlreadyExistsError:
+            job = self.get_job(runner, job_name)
+            if job is None:
+                self.deliveries.release(event.delivery_id)
+                raise
         except Exception:
             self.deliveries.release(event.delivery_id)
             raise
 
+        # Never release after a successful create — retry would double-spawn.
         self.deliveries.mark_done(event.delivery_id, job.object_id)
         return JobAccepted(
             object_id=job.object_id,
-            name=f"job-{event.job_id}",
+            name=job_name,
         )
+
+    def terminate_job(self, runner: Runner, job_id: int) -> None:
+        runner.hydrate()
+        app_name = runner.meta.app_name
+        if not app_name:
+            return
+        try:
+            job = Runner.Job.from_name(
+                app_name,
+                f"job-{job_id}",
+                environment_name=runner.environment_name,
+                client=runner.client,
+            )
+            job.terminate()
+        except (LookupError, modal.exception.NotFoundError):
+            return
+
+    def get_job(self, runner: Runner, job_name: str) -> Runner.Job | None:
+        runner.hydrate()
+        app_name = runner.meta.app_name
+        if not app_name:
+            return None
+        try:
+            return Runner.Job.from_name(
+                app_name,
+                job_name,
+                environment_name=runner.environment_name,
+                client=runner.client,
+            )
+        except (LookupError, modal.exception.NotFoundError):
+            return None
 
     @classmethod
     def for_runner(cls, name: str) -> FastAPI:
