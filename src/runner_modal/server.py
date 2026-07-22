@@ -26,7 +26,9 @@ class GitHubServer:
             raise RuntimeError("RUNNER_MODAL_NAME is not set")
 
         fastapi_app = App.for_runner(name)
-        config = uvicorn.Config(fastapi_app, host="0.0.0.0", port=8000, log_level="info")
+        config = uvicorn.Config(
+            fastapi_app, host="0.0.0.0", port=8000, log_level="info"
+        )
         server = uvicorn.Server(config)
         thread = threading.Thread(
             target=server.run,

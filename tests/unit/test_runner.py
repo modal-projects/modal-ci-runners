@@ -10,7 +10,7 @@ import pytest
 import runner_modal
 from runner_modal import Runner, RunnerInfo
 from runner_modal.exceptions import AuthError, ConcurrencyLimitError, JobTimeoutError
-from runner_modal.runner import JitConfig, TAG_KIND, TAG_KIND_VALUE, TAG_POOL
+from runner_modal.runner import TAG_KIND, TAG_KIND_VALUE, TAG_POOL, JitConfig
 
 
 def test_public_exports_match_modal_style_surface() -> None:
@@ -109,7 +109,9 @@ def test_job_create_uses_jit_secret() -> None:
         patch.object(runner, "has_capacity", return_value=True),
         patch.object(JitConfig, "mint", return_value=JitConfig(encoded="JIT")),
         patch("runner_modal.runner.modal.Secret.from_dict") as from_dict,
-        patch("runner_modal.runner.modal.Sandbox.create", return_value=fake_sb) as create,
+        patch(
+            "runner_modal.runner.modal.Sandbox.create", return_value=fake_sb
+        ) as create,
         patch.object(Runner, "default_image", return_value=MagicMock()),
     ):
         jit_secret = MagicMock()
@@ -140,7 +142,9 @@ def test_job_create_docker_sets_vm() -> None:
         patch.object(runner, "has_capacity", return_value=True),
         patch.object(JitConfig, "mint", return_value=JitConfig(encoded="x")),
         patch("runner_modal.runner.modal.Secret.from_dict", return_value=MagicMock()),
-        patch("runner_modal.runner.modal.Sandbox.create", return_value=fake_sb) as create,
+        patch(
+            "runner_modal.runner.modal.Sandbox.create", return_value=fake_sb
+        ) as create,
         patch.object(Runner, "docker_image", return_value=MagicMock()),
     ):
         Runner.Job.create(

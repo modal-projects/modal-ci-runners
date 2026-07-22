@@ -7,15 +7,20 @@ import os
 import re
 import time
 import uuid
-from collections.abc import Collection, Iterator, Mapping, Sequence
+from collections.abc import Collection, Generator, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import PurePosixPath
-from typing import ClassVar, Generator, Self
+from typing import ClassVar, Self
 
 import httpx
 import modal
 from pydantic import BaseModel, Field
-from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
+from tenacity import (
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
 
 from runner_modal.exceptions import AuthError, ConcurrencyLimitError, JobTimeoutError
 from runner_modal.server import SERVER_CLASS_NAME, GitHubServer
@@ -129,7 +134,7 @@ class RunnerObjects:
         *,
         allow_existing: bool = False,
         environment_name: str | None = None,
-        labels: list[str] | None = None,
+        labels: Sequence[str] | None = None,
         max_concurrent: int | None = None,
         cache: bool = True,
         client: modal.Client | None = None,
@@ -153,7 +158,7 @@ class RunnerObjects:
             name,
             create_if_missing=True,
             environment_name=environment_name,
-            labels=labels,
+            labels=list(labels or []),
             max_concurrent=max_concurrent,
             cache=cache,
             client=client,
@@ -185,7 +190,7 @@ class RunnerObjects:
         *,
         environment_name: str | None = None,
         client: modal.Client | None = None,
-    ) -> list[str]:
+    ) -> Sequence[str]:
         suffix = "-runner-meta"
         names: list[str] = []
         for d in modal.Dict.objects.list(
@@ -201,8 +206,9 @@ class RunnerObjects:
 class Runner:
     """Named CI runner — Volume-shaped lookup + App Server registration.
 
-    ``Runner.create(app, name, …)`` registers the control plane (definition-time).
-    ``Runner.Job.create(runner, …)`` starts a job Sandbox (eager, like ``Sandbox.create``).
+    ``Runner.create(app, name, …)`` registers the control plane
+    (definition-time). ``Runner.Job.create(runner, …)`` starts a job
+    Sandbox (eager, like ``Sandbox.create``).
     """
 
     objects: ClassVar[RunnerObjects] = RunnerObjects()
@@ -213,7 +219,7 @@ class Runner:
         *,
         environment_name: str | None = None,
         create_if_missing: bool = False,
-        labels: list[str] | None = None,
+        labels: Sequence[str] | None = None,
         max_concurrent: int | None = None,
         cache: bool = True,
         client: modal.Client | None = None,
@@ -282,7 +288,7 @@ class Runner:
             app: modal.App | None = None,
             repository: str | None = None,
             jit_config: str | None = None,
-            labels: list[str] | None = None,
+            labels: Sequence[str] | None = None,
             runner_group_id: int = 1,
             runner_name: str | None = None,
             image: modal.Image | None = None,
@@ -327,9 +333,7 @@ class Runner:
                     f"{runner.meta.max_concurrent}"
                 )
 
-            merged_labels: list[str] = list(
-                dict.fromkeys([*(labels or []), *runner.meta.labels])
-            )
+            merged_labels = list(dict.fromkeys([*(labels or []), *runner.meta.labels]))
 
             if jit_config is None:
                 if repository is None:
@@ -344,9 +348,7 @@ class Runner:
             exp = dict(experimental_options or {})
             use_docker = bool(exp.get("vm_runtime"))
             if image is None:
-                image = (
-                    Runner.docker_image() if use_docker else Runner.default_image()
-                )
+                image = Runner.docker_image() if use_docker else Runner.default_image()
 
             vol_map: dict[
                 str | os.PathLike[str], modal.Volume | modal.CloudBucketMount
@@ -379,7 +381,7 @@ class Runner:
                         "dockerd -D >/var/log/dockerd.log 2>&1 & "
                         "for i in $(seq 1 120); do "
                         "docker info >/dev/null 2>&1 && break; sleep 1; done; "
-                        "cd /actions-runner && ./run.sh --jitconfig \"$MODAL_RUNNER_JIT\""
+                        'cd /actions-runner && ./run.sh --jitconfig "$MODAL_RUNNER_JIT"'
                     ),
                 )
             else:
@@ -526,14 +528,12 @@ class Runner:
         app: modal.App,
         name: str,
         *,
-        labels: list[str] | None = None,
+        labels: Sequence[str] | None = None,
         max_concurrent: int | None = None,
         cache: bool = True,
         image: modal.Image | None = None,
         secrets: Collection[modal.Secret] | None = None,
-        volumes: Mapping[
-            str | PurePosixPath, modal.Volume | modal.CloudBucketMount
-        ]
+        volumes: Mapping[str | PurePosixPath, modal.Volume | modal.CloudBucketMount]
         | None = None,
         env: dict[str, str | None] | None = None,
         compute_region: str | Sequence[str] | None = None,
@@ -585,8 +585,10 @@ class Runner:
         vol_map: dict[str | PurePosixPath, modal.Volume | modal.CloudBucketMount] = (
             dict(volumes) if volumes else {}
         )
-        if cache and runner.volume is not None and not any(
-            str(path) == "/cache" for path in vol_map
+        if (
+            cache
+            and runner.volume is not None
+            and not any(str(path) == "/cache" for path in vol_map)
         ):
             vol_map["/cache"] = runner.volume
 
@@ -625,7 +627,7 @@ class Runner:
         *,
         environment_name: str | None = None,
         create_if_missing: bool = False,
-        labels: list[str] | None = None,
+        labels: Sequence[str] | None = None,
         max_concurrent: int | None = None,
         cache: bool = True,
         client: modal.Client | None = None,
@@ -648,12 +650,12 @@ class Runner:
     def ephemeral(
         cls,
         *,
-        labels: list[str] | None = None,
+        labels: Sequence[str] | None = None,
         max_concurrent: int | None = None,
         cache: bool = True,
         client: modal.Client | None = None,
     ) -> Generator[Self, None, None]:
-        """Anonymous Runner for the duration of the context (like ``Volume.ephemeral``)."""
+        """Anonymous Runner for the duration of the context (Volume.ephemeral)."""
         name = f"ephemeral_{uuid.uuid4().hex}"
         runner = cls.from_name(
             name,
@@ -686,7 +688,8 @@ class Runner:
         if existing is None:
             if not self.create_if_missing:
                 raise LookupError(
-                    f"Runner {self.name!r} does not exist; call Runner.create(...) first"
+                    f"Runner {self.name!r} does not exist; "
+                    "call Runner.create(...) first"
                 )
             written = self.meta_dict.put(
                 META_KEY, self.meta.model_dump(mode="json"), skip_if_exists=True
@@ -748,10 +751,7 @@ class Runner:
     def active_count(self, *, app_id: str | None = None) -> int:
         tags: dict[str, str] = {TAG_KIND: TAG_KIND_VALUE, TAG_POOL: self.name}
         return sum(
-            1
-            for _ in modal.Sandbox.list(
-                app_id=app_id, tags=tags, client=self.client
-            )
+            1 for _ in modal.Sandbox.list(app_id=app_id, tags=tags, client=self.client)
         )
 
     def has_capacity(self, *, app_id: str | None = None) -> bool:
