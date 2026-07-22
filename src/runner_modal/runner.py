@@ -32,38 +32,6 @@ JOB_KIND = "runner"
 POOL_TAG = "runner_pool"
 DEFAULT_RUNNER_VERSION = "2.336.0"
 
-# Temporary: tee Worker _diag while run.sh runs for GH Results live-log diagnosis.
-# Replace with a plain ``./run.sh --jitconfig`` once streaming is confirmed.
-RUNNER_DIAG_ENTRYPOINT = """
-set -eu
-cd /actions-runner
-TAILPID=""
-(
-  for _ in $(seq 1 90); do
-    f=$(ls -t _diag/Worker_*.log 2>/dev/null | head -1 || true)
-    if [ -n "${f:-}" ]; then
-      echo "[runner-modal] tailing $f" >&2
-      tail -n 0 -F "$f" &
-      echo $! > /tmp/runner-modal-diag.pid
-      exit 0
-    fi
-    sleep 1
-  done
-) &
-cleanup() {
-  if [ -f /tmp/runner-modal-diag.pid ]; then
-    kill "$(cat /tmp/runner-modal-diag.pid)" 2>/dev/null || true
-  fi
-  echo "[runner-modal] --- _diag Worker (last 200) ---" >&2
-  f=$(ls -t _diag/Worker_*.log 2>/dev/null | head -1 || true)
-  if [ -n "${f:-}" ]; then
-    tail -n 200 "$f" >&2 || true
-  fi
-}
-trap cleanup EXIT
-./run.sh --jitconfig "$MODAL_RUNNER_JIT"
-"""
-
 
 class RunnerMeta(BaseModel):
     """Persisted Runner Dict payload."""
@@ -437,11 +405,15 @@ class Runner:
                         "dockerd -D >/var/log/dockerd.log 2>&1 & "
                         "for i in $(seq 1 120); do "
                         "docker info >/dev/null 2>&1 && break; sleep 1; done; "
-                        + RUNNER_DIAG_ENTRYPOINT
+                        'cd /actions-runner && ./run.sh --jitconfig "$MODAL_RUNNER_JIT"'
                     ),
                 )
             else:
-                entrypoint = ("bash", "-lc", RUNNER_DIAG_ENTRYPOINT)
+                entrypoint = (
+                    "bash",
+                    "-lc",
+                    'cd /actions-runner && ./run.sh --jitconfig "$MODAL_RUNNER_JIT"',
+                )
 
             sandbox = modal.Sandbox.create(
                 *entrypoint,

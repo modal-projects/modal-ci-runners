@@ -22,13 +22,6 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Stream probe
-        run: |
-          for i in $(seq 1 12); do
-            echo "stream-probe line $i $(date -u +%H:%M:%S)"
-            sleep 5
-          done
-
       - name: Install uv
         uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
         with:

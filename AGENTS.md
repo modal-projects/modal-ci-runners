@@ -10,7 +10,7 @@ Concise always-on rules for this repo. Prefer Modal SDK shapes, idiomatic Python
 - **Avoid redundant / encoding noise** in names: no `…Helper`, `…Manager`, `…Utils`, `…Sync` (ambiguous), `…Data`, `FooBarBazResponse` when `FooResponse` / `JitResponse` is enough. Spell units in constants (`DELIVERY_TTL_SECONDS`, not `DELIVERY_TTL_S`).
 - **Tag / env keys:** name the *key* `…_TAG` (e.g. `KIND_TAG`, `POOL_TAG`) and the *value* plainly (`JOB_KIND`). Do not use `TAG_KIND` + `TAG_KIND_VALUE`.
 - **Async boundary:** `async` route reads I/O; sync worker has a clear verb (`process_webhook`), not `…_sync`.
-- Temporary diagnosis hooks must read as temporary (`RUNNER_DIAG_ENTRYPOINT`), not as the permanent product entrypoint name.
+- Temporary diagnosis / repro hooks stay out of product PRs; use a throwaway local branch or one-off workflow for testing, not names that look permanent.
 - Match Modal twin vocabulary for public entities (`create` / `from_name` / `objects` / `ephemeral` / `hydrate`); do not invent parallel jargon for the same idea.
 
 ## Product / DX
