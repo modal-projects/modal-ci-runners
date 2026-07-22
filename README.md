@@ -67,7 +67,15 @@ runner = Runner.create(
 
 Call `Runner.create` **once per App**. The Modal Server class is always `GitHubServer`; the runner `name` identifies Dict/Volume/delivery state via `RUNNER_MODAL_NAME`.
 
-Pool `labels` are an admission filter: the webhook only creates a Job when every pool label appears on the GitHub job. Empty pool labels admit all jobs.
+Pool `labels` are an admission filter: after deploy, the webhook hydrates Runner
+meta and only creates a Job when the GitHub job includes `self-hosted` and every
+pool label. An empty pool label list admits **no** jobs (configure labels on
+`Runner.create`).
+
+Self-hosted runners execute workflow code with access to the runner environment.
+Treat fork PRs and untrusted workflows as hostile; prefer private repos / trusted
+branches, and do not expose a shared org webhook until you understand that blast
+radius.
 
 `cache=True` mounts a shared Modal Volume at `/cache` on job Sandboxes for optional scratch/tooling reuse. It does **not** implement GitHub's `actions/cache` service.
 
