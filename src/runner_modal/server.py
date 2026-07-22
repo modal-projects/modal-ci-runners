@@ -19,13 +19,13 @@ class GitHubServer:
 
     @modal.enter()
     def start(self) -> None:
-        from runner_modal.api import App
+        from runner_modal.api import WebhookApp
 
         name = os.environ.get("RUNNER_MODAL_NAME", "")
         if not name:
             raise RuntimeError("RUNNER_MODAL_NAME is not set")
 
-        fastapi_app = App.for_runner(name)
+        fastapi_app = WebhookApp.for_runner(name)
         config = uvicorn.Config(
             fastapi_app, host="0.0.0.0", port=8000, log_level="info"
         )
