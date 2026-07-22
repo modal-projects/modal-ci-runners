@@ -30,7 +30,7 @@ META_KEY = "runner"
 TAG_KIND = "runner_modal"
 TAG_KIND_VALUE = "runner"
 TAG_POOL = "runner_pool"
-DEFAULT_RUNNER_VERSION = "2.323.0"
+DEFAULT_RUNNER_VERSION = "2.336.0"
 
 
 class RunnerMeta(BaseModel):
