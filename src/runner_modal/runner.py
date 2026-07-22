@@ -14,7 +14,7 @@ from typing import ClassVar, Self
 
 import httpx
 import modal
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 from tenacity import (
     retry,
     retry_if_exception_type,
@@ -25,11 +25,11 @@ from tenacity import (
 from runner_modal.exceptions import AuthError, ConcurrencyLimitError, JobTimeoutError
 from runner_modal.server import SERVER_CLASS_NAME, GitHubServer
 
-NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,127}$")
+RUNNER_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,127}$")
 META_KEY = "runner"
-TAG_KIND = "runner_modal"
-TAG_KIND_VALUE = "runner"
-TAG_POOL = "runner_pool"
+KIND_TAG = "runner_modal"
+JOB_KIND = "runner"
+POOL_TAG = "runner_pool"
 DEFAULT_RUNNER_VERSION = "2.336.0"
 
 
@@ -42,6 +42,11 @@ class RunnerMeta(BaseModel):
     cache: bool = True
     app_name: str | None = None
     server_name: str | None = None
+    # Slim defaults applied by Job.create / webhook when kwargs are omitted.
+    region: str | list[str] | None = None
+    idle_timeout: int | None = None
+    experimental_options: dict[str, object] | None = None
+    runner_group_id: int = 1
 
 
 class RunnerInfo(BaseModel):
@@ -56,6 +61,14 @@ class RunnerInfo(BaseModel):
     active_runners: int
     app_name: str | None
     server_name: str | None
+
+
+class JitResponse(BaseModel):
+    """GitHub generate-jitconfig JSON body."""
+
+    model_config = {"frozen": True}
+
+    encoded_jit_config: str
 
 
 class JitConfig(BaseModel):
@@ -86,7 +99,7 @@ class JitConfig(BaseModel):
         base = f"https://{domain}/api/v3" if domain else "https://api.github.com"
         url = f"{base}/repos/{owner}/{repo}/actions/runners/generate-jitconfig"
         return cls(
-            encoded=cls._post(
+            encoded=cls.post(
                 url,
                 {
                     "name": name or f"modal-{int(time.time())}",
@@ -111,7 +124,7 @@ class JitConfig(BaseModel):
         wait=wait_exponential(multiplier=1, min=1, max=8),
         reraise=True,
     )
-    def _post(url: str, payload: dict[str, object], headers: dict[str, str]) -> str:
+    def post(url: str, payload: dict[str, object], headers: dict[str, str]) -> str:
         resp = httpx.post(url, json=payload, headers=headers, timeout=30.0)
         if resp.status_code in (401, 403):
             raise AuthError(f"generate-jitconfig: HTTP {resp.status_code}")
@@ -119,10 +132,11 @@ class JitConfig(BaseModel):
             resp.raise_for_status()
         if resp.status_code >= 400:
             raise ValueError(f"generate-jitconfig: HTTP {resp.status_code}")
-        encoded = resp.json().get("encoded_jit_config")
-        if not encoded:
-            raise ValueError("generate-jitconfig: missing encoded_jit_config")
-        return str(encoded)
+        try:
+            body = JitResponse.model_validate(resp.json())
+        except ValidationError as e:
+            raise ValueError("generate-jitconfig: missing encoded_jit_config") from e
+        return body.encoded_jit_config
 
 
 class RunnerObjects:
@@ -139,7 +153,7 @@ class RunnerObjects:
         cache: bool = True,
         client: modal.Client | None = None,
     ) -> None:
-        if not NAME_RE.fullmatch(name):
+        if not RUNNER_NAME_RE.fullmatch(name):
             raise ValueError(f"invalid Runner name {name!r}")
         modal.Dict.objects.create(
             f"{name}-runner-meta",
@@ -236,7 +250,7 @@ class Runner:
         )
         self.meta_dict: modal.Dict | None = None
         self.volume: modal.Volume | None = None
-        self._hydrated = False
+        self.hydrated = False
 
     class Job:
         """One CI job — Sandbox twin (``sb-…``)."""
@@ -276,7 +290,7 @@ class Runner:
             tags: dict[str, str] | None = None,
             client: modal.Client | None = None,
         ) -> Iterator[Runner.Job]:
-            merged = {TAG_KIND: TAG_KIND_VALUE, **(tags or {})}
+            merged = {KIND_TAG: JOB_KIND, **(tags or {})}
             for sb in modal.Sandbox.list(app_id=app_id, tags=merged, client=client):
                 yield cls(sb)
 
@@ -289,7 +303,7 @@ class Runner:
             repository: str | None = None,
             jit_config: str | None = None,
             labels: Sequence[str] | None = None,
-            runner_group_id: int = 1,
+            runner_group_id: int | None = None,
             runner_name: str | None = None,
             image: modal.Image | None = None,
             env: dict[str, str | None] | None = None,
@@ -334,6 +348,17 @@ class Runner:
                 )
 
             merged_labels = list(dict.fromkeys([*(labels or []), *runner.meta.labels]))
+            group_id = (
+                runner_group_id
+                if runner_group_id is not None
+                else runner.meta.runner_group_id
+            )
+            job_region = region if region is not None else runner.meta.region
+            job_idle = (
+                idle_timeout if idle_timeout is not None else runner.meta.idle_timeout
+            )
+            exp = dict(runner.meta.experimental_options or {})
+            exp.update(experimental_options or {})
 
             if jit_config is None:
                 if repository is None:
@@ -341,11 +366,10 @@ class Runner:
                 jit_config = JitConfig.mint(
                     repository=repository,
                     labels=merged_labels or ["self-hosted", "modal"],
-                    runner_group_id=runner_group_id,
+                    runner_group_id=group_id,
                     name=runner_name or name,
                 ).encoded
 
-            exp = dict(experimental_options or {})
             use_docker = bool(exp.get("vm_runtime"))
             if image is None:
                 image = Runner.docker_image() if use_docker else Runner.default_image()
@@ -360,8 +384,8 @@ class Runner:
 
             merged_tags: dict[str, str] = {
                 **(tags or {}),
-                TAG_KIND: TAG_KIND_VALUE,
-                TAG_POOL: runner.name,
+                KIND_TAG: JOB_KIND,
+                POOL_TAG: runner.name,
             }
             if repository:
                 merged_tags["repository"] = repository.replace("/", "_")
@@ -399,11 +423,11 @@ class Runner:
                 secrets=merged_secrets,
                 volumes=vol_map,
                 timeout=timeout,
-                idle_timeout=idle_timeout,
+                idle_timeout=job_idle,
                 workdir=workdir,
                 gpu=gpu,
                 cloud=cloud,
-                region=region,
+                region=job_region,
                 cpu=cpu,
                 memory=memory,
                 block_network=block_network,
@@ -433,10 +457,10 @@ class Runner:
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
 
-                def _wait() -> None:
+                def wait_sandbox() -> None:
                     self.sandbox.wait(raise_on_termination=False)
 
-                fut: concurrent.futures.Future[None] = pool.submit(_wait)
+                fut: concurrent.futures.Future[None] = pool.submit(wait_sandbox)
                 try:
                     fut.result(timeout=timeout)
                 except concurrent.futures.TimeoutError:
@@ -555,13 +579,22 @@ class Runner:
         proxy: modal.Proxy | None = None,
         environment_name: str | None = None,
         client: modal.Client | None = None,
+        idle_timeout: int | None = None,
+        experimental_options: dict[str, object] | None = None,
+        runner_group_id: int | None = None,
     ) -> Self:
         """Register control plane on ``app`` (definition-time — not a Sandbox).
 
         Call once per App. Runner ``name`` identifies Dict/Volume state; the Modal
         Server class is always ``GitHubServer`` (Modal has no Server parameters).
+
+        ``cache=True`` mounts a shared Volume at ``/cache`` on job Sandboxes — this is
+        not the GitHub Actions cache service (``actions/cache``).
+
+        Optional ``compute_region``, ``idle_timeout``, ``experimental_options``, and
+        ``runner_group_id`` are stored as slim Job defaults for omitted kwargs.
         """
-        if not NAME_RE.fullmatch(name):
+        if not RUNNER_NAME_RE.fullmatch(name):
             raise ValueError(f"invalid Runner name {name!r}")
         if not app.name:
             raise ValueError(
@@ -577,8 +610,39 @@ class Runner:
             cache=cache,
             client=client,
         )
-        runner.meta = runner.meta.model_copy(
-            update={"app_name": app.name, "server_name": SERVER_CLASS_NAME}
+        region_default: str | list[str] | None
+        if compute_region is None:
+            region_default = runner.meta.region
+        elif isinstance(compute_region, str):
+            region_default = compute_region
+        else:
+            region_default = list(compute_region)
+
+        runner.meta = RunnerMeta(
+            name=runner.meta.name,
+            labels=list(labels) if labels is not None else list(runner.meta.labels),
+            max_concurrent=(
+                max_concurrent
+                if max_concurrent is not None
+                else runner.meta.max_concurrent
+            ),
+            cache=cache,
+            app_name=app.name,
+            server_name=SERVER_CLASS_NAME,
+            region=region_default,
+            idle_timeout=(
+                idle_timeout if idle_timeout is not None else runner.meta.idle_timeout
+            ),
+            experimental_options=(
+                dict(experimental_options)
+                if experimental_options is not None
+                else runner.meta.experimental_options
+            ),
+            runner_group_id=(
+                runner_group_id
+                if runner_group_id is not None
+                else runner.meta.runner_group_id
+            ),
         )
         runner.persist_meta()
 
@@ -633,7 +697,7 @@ class Runner:
         client: modal.Client | None = None,
     ) -> Self:
         """Reference a Runner by name (Volume-shaped; hydrate on first use)."""
-        if not NAME_RE.fullmatch(name):
+        if not RUNNER_NAME_RE.fullmatch(name):
             raise ValueError(f"invalid Runner name {name!r}")
         return cls(
             name,
@@ -675,7 +739,7 @@ class Runner:
         return f"Runner.from_name({self.name!r})"
 
     def hydrate(self) -> None:
-        if self._hydrated:
+        if self.hydrated:
             return
 
         self.meta_dict = modal.Dict.from_name(
@@ -701,13 +765,12 @@ class Runner:
                 self.meta = RunnerMeta.model_validate(existing)
         else:
             loaded = RunnerMeta.model_validate(existing)
-            updates: dict[str, object] = {}
-            if self.meta.app_name and not loaded.app_name:
-                updates["app_name"] = self.meta.app_name
-            if self.meta.server_name and not loaded.server_name:
-                updates["server_name"] = self.meta.server_name
-            self.meta = loaded.model_copy(update=updates) if updates else loaded
-            if updates:
+            app_name = self.meta.app_name or loaded.app_name
+            server_name = self.meta.server_name or loaded.server_name
+            self.meta = loaded.model_copy(
+                update={"app_name": app_name, "server_name": server_name}
+            )
+            if app_name != loaded.app_name or server_name != loaded.server_name:
                 self.persist_meta()
 
         if self.meta.cache:
@@ -719,7 +782,7 @@ class Runner:
             )
         else:
             self.volume = None
-        self._hydrated = True
+        self.hydrated = True
 
     def persist_meta(self) -> None:
         self.hydrate()
@@ -749,7 +812,7 @@ class Runner:
             return None
 
     def active_count(self, *, app_id: str | None = None) -> int:
-        tags: dict[str, str] = {TAG_KIND: TAG_KIND_VALUE, TAG_POOL: self.name}
+        tags: dict[str, str] = {KIND_TAG: JOB_KIND, POOL_TAG: self.name}
         return sum(
             1 for _ in modal.Sandbox.list(app_id=app_id, tags=tags, client=self.client)
         )

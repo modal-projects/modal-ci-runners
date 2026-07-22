@@ -2,6 +2,17 @@
 
 Concise always-on rules for this repo. Prefer Modal SDK shapes, idiomatic Python, and library-native APIs. Do not treat this as a product README.
 
+## Naming
+
+- Prefer short, concrete nouns and verbs. Say what the thing **is** or **does** in one pass.
+- **No underscore-prefix for “privacy.”** Types, module constants, methods, and test helpers are normal names; omit from `__all__` if internal. Do not invent `_Foo`, `_helper`, `_post`.
+- **Do not shadow Modal / stdlib names.** Never call our FastAPI control plane `App` (that is `modal.App`). Prefer `WebhookApp`, `DeliveryStore`, etc.
+- **Avoid redundant / encoding noise** in names: no `…Helper`, `…Manager`, `…Utils`, `…Sync` (ambiguous), `…Data`, `FooBarBazResponse` when `FooResponse` / `JitResponse` is enough. Spell units in constants (`DELIVERY_TTL_SECONDS`, not `DELIVERY_TTL_S`).
+- **Tag / env keys:** name the *key* `…_TAG` (e.g. `KIND_TAG`, `POOL_TAG`) and the *value* plainly (`JOB_KIND`). Do not use `TAG_KIND` + `TAG_KIND_VALUE`.
+- **Async boundary:** `async` route reads I/O; sync worker has a clear verb (`process_webhook`), not `…_sync`.
+- Temporary diagnosis / repro hooks stay out of product PRs; use a throwaway local branch or one-off workflow for testing, not names that look permanent.
+- Match Modal twin vocabulary for public entities (`create` / `from_name` / `objects` / `ephemeral` / `hydrate`); do not invent parallel jargon for the same idea.
+
 ## Product / DX
 
 - Public surface is entity-based: `Runner` + nested `Runner.Job`. Mirror Modal (`create` / `from_name` / `objects` / `ephemeral`; Job ≈ Sandbox).
@@ -50,6 +61,8 @@ Concise always-on rules for this repo. Prefer Modal SDK shapes, idiomatic Python
 ## Never do
 
 - Process-local `_REGISTRY` / create caches / fake idempotency
+- Underscore-prefixing types or helpers for privacy (`_Foo`, `_helper`) — omit from `__all__` instead
+- Naming our types `App` (conflicts with `modal.App`) or other Modal entity names
 - `getattr` / `hasattr` / `object.__new__` / blocked `__init__` / mutating `__name__` for Modal Server identity
 - None-filtered `**kwargs` bags into Modal APIs
 - Tagged resource unions / xor validators / `sandbox_kwargs` helpers instead of Modal flat kwargs

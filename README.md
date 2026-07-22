@@ -7,8 +7,9 @@ Register a webhook control plane with `Runner.create`, deploy it, point GitHub a
 ## Features
 
 - **Modal twin API** — `Runner` ≈ Volume + Server; `Runner.Job` ≈ Sandbox (`create` / `from_name` / `from_id` / `wait`)
-- **GitHub webhook** — HMAC verify, delivery claim, sync job create → 200 / 204 / 5xx
+- **GitHub webhook** — HMAC verify, label admission, delivery claim, cancel terminate → 200 / 204 / 5xx
 - **Flat Sandbox resources** — `cpu`, `memory`, `gpu`, `experimental_options={"vm_runtime": True}`
+- **Shared `/cache` Volume** — optional mount across jobs (`cache=True`); not the GitHub Actions cache service
 - **uv-native images** — example control plane via `Image.uv_sync()`; published install via `uv_pip_install("runner-modal")`
 
 ## Requirements
@@ -60,10 +61,15 @@ runner = Runner.create(
     compute_region="us-east",
     labels=["self-hosted", "modal", "acme"],
     max_concurrent=20,
+    idle_timeout=900,
 )
 ```
 
 Call `Runner.create` **once per App**. The Modal Server class is always `GitHubServer`; the runner `name` identifies Dict/Volume/delivery state via `RUNNER_MODAL_NAME`.
+
+Pool `labels` are an admission filter: the webhook only creates a Job when every pool label appears on the GitHub job. Empty pool labels admit all jobs.
+
+`cache=True` mounts a shared Modal Volume at `/cache` on job Sandboxes for optional scratch/tooling reuse. It does **not** implement GitHub's `actions/cache` service.
 
 ### 3. Wire GitHub
 
