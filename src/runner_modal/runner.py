@@ -39,6 +39,8 @@ class RunnerMeta(BaseModel):
     server_name: str | None = None
     # Named Modal Secret from Runner.create (GITHUB_TOKEN + WEBHOOK_SECRET).
     secret_name: str | None = None
+    # Named Job Sandbox image published at Runner.create (``Image.from_name``).
+    job_image_name: str | None = None
     github_enterprise_domain: str | None = None
     # Slim defaults applied by Job.create / webhook when kwargs are omitted.
     region: str | list[str] | None = None
@@ -60,6 +62,7 @@ class RunnerInfo(BaseModel):
     app_name: str | None
     server_name: str | None
     secret_name: str | None
+    job_image_name: str | None
 
 
 class RunnerObjects:
@@ -293,7 +296,17 @@ class Runner:
 
             use_docker = bool(exp.get("vm_runtime"))
             if image is None:
-                image = Runner.docker_image() if use_docker else Runner.default_image()
+                if runner.meta.job_image_name:
+                    image = modal.Image.from_name(
+                        runner.meta.job_image_name,
+                        environment_name=environment_name or runner.environment_name,
+                        client=client or runner.client,
+                    )
+                else:
+                    # Imperative / objects-only: build from this uv project (repo root).
+                    image = (
+                        Runner.docker_image() if use_docker else Runner.default_image()
+                    )
 
             vol_map: dict[
                 str | os.PathLike[str], modal.Volume | modal.CloudBucketMount
@@ -388,9 +401,11 @@ class Runner:
 
     @classmethod
     def control_plane_image(cls) -> modal.Image:
-        """Slim Server image — installs the ``runner-modal`` package."""
-        return modal.Image.debian_slim(python_version="3.12").uv_pip_install(
-            "runner-modal"
+        """Server image — uv project deps + local ``runner_modal`` (repo root)."""
+        return (
+            modal.Image.debian_slim(python_version="3.12")
+            .uv_sync()
+            .add_local_python_source("runner_modal")
         )
 
     @classmethod
@@ -412,10 +427,14 @@ class Runner:
     def default_image(
         cls, *, runner_version: str = DEFAULT_RUNNER_VERSION
     ) -> modal.Image:
-        """gVisor job image with Actions runner (CPU/GPU)."""
-        return cls.install_actions_runner(
+        """gVisor job image with Actions runner (CPU/GPU).
+
+        Call from the repo root so ``uv_sync()`` sees this uv project.
+        ``uv_sync()`` installs lockfile deps only; ``add_local_python_source``
+        (``copy=True``, last) bakes ``runner_modal`` into the published Image.
+        """
+        base = (
             modal.Image.debian_slim(python_version="3.12")
-            .uv_pip_install("runner-modal")
             .apt_install(
                 "curl",
                 "ca-certificates",
@@ -427,19 +446,24 @@ class Runner:
                 "unzip",
                 "zip",
             )
-            .env({"RUNNER_ALLOW_RUNASROOT": "1"}),
-            runner_version=runner_version,
+            .uv_sync()
+            .env({"RUNNER_ALLOW_RUNASROOT": "1"})
+        )
+        return cls.install_actions_runner(
+            base, runner_version=runner_version
+        ).add_local_python_source(
+            "runner_modal",
+            copy=True,
         )
 
     @classmethod
     def docker_image(
         cls, *, runner_version: str = DEFAULT_RUNNER_VERSION
     ) -> modal.Image:
-        """VM job image with dockerd (no GPU)."""
-        return cls.install_actions_runner(
+        """VM job image with dockerd (no GPU). Deploy/run from the repo root."""
+        base = (
             modal.Image.from_registry("ubuntu:24.04")
             .env({"DEBIAN_FRONTEND": "noninteractive", "RUNNER_ALLOW_RUNASROOT": "1"})
-            .uv_pip_install("runner-modal")
             .apt_install(
                 "curl",
                 "ca-certificates",
@@ -450,8 +474,14 @@ class Runner:
                 "tar",
                 "unzip",
                 "zip",
-            ),
-            runner_version=runner_version,
+            )
+            .uv_sync()
+        )
+        return cls.install_actions_runner(
+            base, runner_version=runner_version
+        ).add_local_python_source(
+            "runner_modal",
+            copy=True,
         )
 
     @classmethod
@@ -501,6 +531,10 @@ class Runner:
         ``GITHUB_TOKEN`` and ``WEBHOOK_SECRET``. The name is persisted so the
         webhook can pass the same Secret into ``Job.create``.
 
+        Job Sandbox images are built and published here as a named Image
+        (``"{name}-job"``) via ``Image.build`` + ``publish``, so the Server can
+        ``Image.from_name`` without reconstructing local ``uv_sync`` mounts.
+
         ``cache=True`` mounts a shared Volume at ``/cache`` on job Sandboxes — this is
         not the GitHub Actions cache service (``actions/cache``).
         """
@@ -534,6 +568,25 @@ class Runner:
         else:
             region_default = list(compute_region)
 
+        exp = (
+            dict(experimental_options)
+            if experimental_options is not None
+            else dict(prior.experimental_options or {})
+        )
+        job_image_name = f"{name}-job"
+        recipe = cls.docker_image() if exp.get("vm_runtime") else cls.default_image()
+        build_app = modal.App.lookup(
+            app.name,
+            create_if_missing=True,
+            environment_name=environment_name,
+            client=client,
+        )
+        recipe.build(build_app).publish(
+            job_image_name,
+            environment_name=environment_name,
+            client=client,
+        )
+
         runner.meta = RunnerMeta(
             name=name,
             labels=list(labels) if labels is not None else list(prior.labels),
@@ -544,6 +597,7 @@ class Runner:
             app_name=app.name,
             server_name=SERVER_CLASS_NAME,
             secret_name=secret_name,
+            job_image_name=job_image_name,
             github_enterprise_domain=(
                 github_enterprise_domain
                 if github_enterprise_domain is not None
@@ -553,11 +607,7 @@ class Runner:
             idle_timeout=(
                 idle_timeout if idle_timeout is not None else prior.idle_timeout
             ),
-            experimental_options=(
-                dict(experimental_options)
-                if experimental_options is not None
-                else prior.experimental_options
-            ),
+            experimental_options=exp or None,
             runner_group_id=(
                 runner_group_id
                 if runner_group_id is not None
@@ -784,4 +834,5 @@ class Runner:
             app_name=self.meta.app_name,
             server_name=self.meta.server_name,
             secret_name=self.meta.secret_name,
+            job_image_name=self.meta.job_image_name,
         )

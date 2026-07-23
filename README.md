@@ -12,11 +12,7 @@ One public type — `Runner` — registers a webhook control plane. Jobs run as 
 
 ## Installation
 
-```bash
-uv add runner-modal
-```
-
-From this repo:
+From this repo (uv project — deploy and `modal run` from the repo root):
 
 ```bash
 uv sync
@@ -41,7 +37,7 @@ modal secret create github-runner \
 
 ### 2. Deploy the control plane
 
-From the repo root (so `uv_sync()` sees the project):
+From the repo root so `uv_sync()` / `add_local_python_source("runner_modal")` see the project:
 
 ```bash
 modal deploy examples/github_webhook.py
@@ -61,7 +57,6 @@ runner = Runner.create(
     app=app,
     name="acme",
     secret=gh,
-    image=modal.Image.debian_slim(python_version="3.12").uv_sync(),
     compute_region="us-east",
     labels=["self-hosted", "modal", "acme"],
     max_concurrent=20,
@@ -69,7 +64,9 @@ runner = Runner.create(
 )
 ```
 
-Call `Runner.create` **once per App**. The Server class is always `GitHubServer`; identity is `RUNNER_MODAL_NAME` + persisted `secret_name`.
+`Runner.create` builds and publishes the job Sandbox image as a named Image (`"{name}-job"`) via `Image.build` + `publish`, and persists `job_image_name` next to `secret_name`. The Server later uses `Image.from_name` — it does not rebuild local mounts.
+
+Call `Runner.create` **once per App**. The Server class is always `GitHubServer`; identity is `RUNNER_MODAL_NAME` + persisted meta.
 
 ### 3. Point GitHub at the webhook
 
@@ -96,7 +93,8 @@ GitHub  --workflow_job-->  GitHubServer
                               │
                        claim delivery ID
                               │
-                       Job.create(secret=from_name(secret_name))
+                       Job.create(secret=from_name(secret_name),
+                                  image=from_name(job_image_name))
                               │
                        python -m runner_modal.job
                               │
@@ -107,7 +105,7 @@ GitHub  --workflow_job-->  GitHubServer
 
 | Piece | Modal object | Role |
 |-------|--------------|------|
-| Meta | Dict `{name}-runner-meta` | Labels, capacity, `secret_name`, defaults |
+| Meta | Dict `{name}-runner-meta` | Labels, capacity, `secret_name`, `job_image_name`, defaults |
 | Deliveries | Dict `{name}-runner-deliveries` | Claim **before** create |
 | Cache | Volume `{name}-cache` → `/cache` | Optional scratch — **not** `actions/cache` |
 | Control plane | Server `GitHubServer` | HMAC, admission, create/cancel |

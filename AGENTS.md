@@ -53,7 +53,7 @@ Concise always-on rules for this repo. Prefer Modal SDK shapes, idiomatic Python
 ## Layout, images, tests
 
 - Modules by responsibility: `runner` / `job` / `api` / `server` / `exceptions`. Keep nested `Job` if it matches the Modal twin; extract collaborators (JIT, images, meta) if `runner.py` grows further — don’t pile every concern into one god module.
-- Images: examples use `Image.…uv_sync()` from the repo root; published control plane uses `uv_pip_install("runner-modal")`. No Path / `add_local_dir` for package install.
+- Images: control plane builds on deploy (`control_plane_image`: `uv_sync` + `add_local_python_source`). Job Sandboxes use a **named Image** (`"{name}-job"`): `Runner.create` does `Image.build(App.lookup(...)).publish(...)` from the repo root; webhook `Job.create` uses `Image.from_name` only. Do not use `uv_pip_install("runner-modal")` until published. No Path / `add_local_dir` for package install.
 - One unit test file per impl file (`test_runner.py`, `test_job.py`, `test_api.py`, `test_server.py`, `test_exceptions.py`).
 - Test HMAC failure, delivery claim, and capacity semantics — not only exports / signatures.
 - Retries (tenacity): transient network / timeouts / 5xx only. Never retry 401 / 403 / validation errors.
