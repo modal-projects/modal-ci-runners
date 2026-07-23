@@ -39,8 +39,8 @@ Concise always-on rules for this repo. Prefer Modal SDK shapes, idiomatic Python
 - Do not wrap Modal / httpx failures in `RunnerError`. Propagate; map only product/auth cases.
 - FastAPI: HTTP status conveys success. Response models without `ok: bool`. Use `HTTPException` for 401 / 400 / 503.
 - Sync I/O (Modal SDK, httpx): use sync `def` endpoints or `asyncio.to_thread`. Never block `async def` handlers with sync Modal/httpx calls.
-- Credentials and JIT configs via `modal.Secret`. Never put `GITHUB_TOKEN`, `WEBHOOK_SECRET`, or JIT strings in Sandbox `env=` dicts.
-- Sandbox / Job `secrets=` do **not** authenticate parent-process API calls (JIT mint reads process env / Server Secret). Document that; never imply otherwise.
+- Credentials via required named `modal.Secret` on `Runner.create(secret=…)` and `Job.create(secret=…)`. Never put `GITHUB_TOKEN`, `WEBHOOK_SECRET`, or JIT strings in Sandbox `env=` dicts. No `os.environ.get` credential fallbacks — require explicit kwargs / Secret injection.
+- JIT mint runs only inside the Job (`python -m runner_modal.job`) from `GITHUB_TOKEN` injected by `secret=`. `WebhookApp` takes an explicit `webhook_secret=`; Server start requires `WEBHOOK_SECRET` from the mounted Secret (KeyError if missing).
 - Verify GitHub webhooks with `hmac.compare_digest` on the raw body before parse.
 
 ## Concurrency & shared state
@@ -52,9 +52,9 @@ Concise always-on rules for this repo. Prefer Modal SDK shapes, idiomatic Python
 
 ## Layout, images, tests
 
-- Modules by responsibility: `runner` / `api` / `server` / `exceptions`. Keep nested `Job` if it matches the Modal twin; extract collaborators (JIT, images, meta) if `runner.py` grows further — don’t pile every concern into one god module.
+- Modules by responsibility: `runner` / `job` / `api` / `server` / `exceptions`. Keep nested `Job` if it matches the Modal twin; extract collaborators (JIT, images, meta) if `runner.py` grows further — don’t pile every concern into one god module.
 - Images: examples use `Image.…uv_sync()` from the repo root; published control plane uses `uv_pip_install("runner-modal")`. No Path / `add_local_dir` for package install.
-- One unit test file per impl file (`test_runner.py`, `test_api.py`, `test_server.py`, `test_exceptions.py`).
+- One unit test file per impl file (`test_runner.py`, `test_job.py`, `test_api.py`, `test_server.py`, `test_exceptions.py`).
 - Test HMAC failure, delivery claim, and capacity semantics — not only exports / signatures.
 - Retries (tenacity): transient network / timeouts / 5xx only. Never retry 401 / 403 / validation errors.
 
@@ -69,7 +69,7 @@ Concise always-on rules for this repo. Prefer Modal SDK shapes, idiomatic Python
 - `ok: bool` on HTTP response models
 - Blanket `except Exception: raise RunnerError(...)`
 - Exception taxonomy for every Modal failure mode
-- Tokens or JIT in `env=`; assuming Job `secrets=` mint JIT in the parent
+- Tokens or JIT in `env=`; `os.environ.get` credential fallbacks; minting JIT in the parent process
 - Blocking the asyncio event loop with Modal / httpx in `async def`
 - Claim-after-create webhook deliveries
 - Treating soft capacity as a hard reservation

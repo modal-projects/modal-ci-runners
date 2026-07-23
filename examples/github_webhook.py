@@ -10,6 +10,9 @@ Setup:
 
 Webhook: ``{runner.url}/github``
 runs-on: [self-hosted, modal, acme, \"job-${{ github.run_id }}-${{ github.job }}\"]
+
+``secret=`` must be a named Modal Secret with ``GITHUB_TOKEN`` (Job mint) and
+``WEBHOOK_SECRET`` (Server HMAC).
 """
 
 from __future__ import annotations
@@ -19,13 +22,16 @@ import modal
 from runner_modal import Runner
 
 app = modal.App("acme-ci")
-gh = modal.Secret.from_name("github-runner")
+gh = modal.Secret.from_name(
+    "github-runner",
+    required_keys=["GITHUB_TOKEN", "WEBHOOK_SECRET"],
+)
 
 runner = Runner.create(
     app=app,
     name="acme",
+    secret=gh,
     image=modal.Image.debian_slim(python_version="3.12").uv_sync(),
-    secrets=[gh],
     compute_region="us-east",
     labels=["self-hosted", "modal", "acme"],
     max_concurrent=20,

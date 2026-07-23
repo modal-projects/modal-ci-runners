@@ -1,10 +1,7 @@
 """Imperative Runner.Job.create — one job Sandbox without the webhook.
 
-Requires a local GITHUB_TOKEN (JIT mint runs in this process). Sandbox
-``secrets=[gh]`` alone does not authenticate mint.
+JIT mint runs inside the Sandbox using ``GITHUB_TOKEN`` from an explicit Secret.
 
-  export GITHUB_TOKEN=ghp_...
-  # optional: modal secret for the job container if your workflow needs it
   modal secret create github-runner GITHUB_TOKEN=ghp_...
 
 Run (from repo root):
@@ -20,6 +17,7 @@ import modal
 from runner_modal import Runner
 
 app = modal.App("runner-modal-example")
+gh = modal.Secret.from_name("github-runner", required_keys=["GITHUB_TOKEN"])
 
 Runner.objects.create(
     "demo",
@@ -40,6 +38,7 @@ def main(repository: str = "octocat/Hello-World") -> None:
         app=parent,
         repository=repository,
         labels=["modal", "demo", unique],
+        secret=gh,
         cpu=2.0,
         region="us-east",
         timeout=30 * 60,
