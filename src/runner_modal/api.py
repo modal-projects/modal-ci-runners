@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
-import os
 import time
 from collections.abc import Mapping
 from typing import Literal, Self
@@ -66,11 +65,10 @@ class WorkflowJobEvent(BaseModel):
         body: bytes,
         headers: Mapping[str, str],
         *,
-        secret: str | None = None,
+        secret: str,
     ) -> Self | None:
-        secret = secret or os.environ.get("WEBHOOK_SECRET")
         if not secret:
-            raise AuthError("WEBHOOK_SECRET is required to verify GitHub webhooks")
+            raise AuthError("webhook secret is required")
 
         hdrs = {k.lower(): v for k, v in headers.items()}
         signature = hdrs.get("x-hub-signature-256")
@@ -179,8 +177,11 @@ class DeliveryStore:
 class WebhookApp:
     """FastAPI control plane for a named Runner (Modal Server mounts this)."""
 
-    def __init__(self, runner_name: str) -> None:
+    def __init__(self, runner_name: str, *, webhook_secret: str) -> None:
+        if not webhook_secret:
+            raise AuthError("webhook_secret is required")
         self.runner_name = runner_name
+        self.webhook_secret = webhook_secret
         self.deliveries = DeliveryStore(runner_name)
         self.fastapi = FastAPI()
         self.fastapi.get("/health", response_model=HealthResponse)(self.health)
@@ -210,7 +211,9 @@ class WebhookApp:
         self, body: bytes, headers: dict[str, str]
     ) -> JobAccepted | Response:
         try:
-            event = WorkflowJobEvent.from_request(body, headers)
+            event = WorkflowJobEvent.from_request(
+                body, headers, secret=self.webhook_secret
+            )
         except AuthError as e:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED, detail=str(e)
@@ -229,11 +232,7 @@ class WebhookApp:
             self.terminate_job(runner, event.job_id)
             return Response(status_code=status.HTTP_204_NO_CONTENT)
 
-        runner.hydrate()
-        pool = set(runner.meta.labels)
-        job_labels = set(event.labels)
-        # Require self-hosted + configured pool labels (empty pool admits nothing).
-        if "self-hosted" not in job_labels or not pool or not pool <= job_labels:
+        if not runner.admits(event.labels):
             return Response(status_code=status.HTTP_204_NO_CONTENT)
 
         existing = self.deliveries.try_claim(event.delivery_id)
@@ -252,7 +251,13 @@ class WebhookApp:
                 repository=event.repo,
                 labels=event.labels,
                 name=job_name,
+                secret=runner.github_secret(),
             )
+        except LookupError as e:
+            self.deliveries.release(event.delivery_id)
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e)
+            ) from e
         except ConcurrencyLimitError as e:
             self.deliveries.release(event.delivery_id)
             raise HTTPException(
@@ -274,23 +279,7 @@ class WebhookApp:
             name=job_name,
         )
 
-    def terminate_job(self, runner: Runner, job_id: int) -> None:
-        runner.hydrate()
-        app_name = runner.meta.app_name
-        if not app_name:
-            return
-        try:
-            job = Runner.Job.from_name(
-                app_name,
-                f"job-{job_id}",
-                environment_name=runner.environment_name,
-                client=runner.client,
-            )
-            job.terminate()
-        except (LookupError, modal.exception.NotFoundError):
-            return
-
-    def get_job(self, runner: Runner, job_name: str) -> Runner.Job | None:
+    def job_from_name(self, runner: Runner, job_name: str) -> Runner.Job | None:
         runner.hydrate()
         app_name = runner.meta.app_name
         if not app_name:
@@ -305,6 +294,14 @@ class WebhookApp:
         except (LookupError, modal.exception.NotFoundError):
             return None
 
+    def terminate_job(self, runner: Runner, job_id: int) -> None:
+        job = self.job_from_name(runner, f"job-{job_id}")
+        if job is not None:
+            job.terminate()
+
+    def get_job(self, runner: Runner, job_name: str) -> Runner.Job | None:
+        return self.job_from_name(runner, job_name)
+
     @classmethod
-    def for_runner(cls, name: str) -> FastAPI:
-        return cls(name).fastapi
+    def for_runner(cls, name: str, *, webhook_secret: str) -> FastAPI:
+        return cls(name, webhook_secret=webhook_secret).fastapi

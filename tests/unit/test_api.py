@@ -27,6 +27,7 @@ def sign(body: bytes, secret: str) -> str:
 
 
 POOL_LABELS = ["self-hosted", "modal", "acme"]
+HOOK = "hook"
 
 
 def queued_body(*, labels: list[str] | None = None) -> bytes:
@@ -67,29 +68,41 @@ def mock_runner(*, labels: list[str] | None = None) -> MagicMock:
             labels=pool,
             app_name=runner.meta.app_name,
             server_name=runner.meta.server_name,
+            secret_name="github-runner",
         )
 
+    def admits(job_labels: list[str]) -> bool:
+        runner.hydrate()
+        configured = set(runner.meta.labels)
+        present = set(job_labels)
+        return bool(configured) and "self-hosted" in present and configured <= present
+
     runner.hydrate.side_effect = hydrate
+    runner.admits.side_effect = admits
+    runner.github_secret.return_value = MagicMock(name="github-secret")
     return runner
 
 
-def post_github(client: TestClient, body: bytes, *, delivery: str = "d") -> object:
-    return client.post(
+def client() -> TestClient:
+    return TestClient(WebhookApp.for_runner("acme", webhook_secret=HOOK))
+
+
+def post_github(test_client: TestClient, body: bytes, *, delivery: str = "d") -> object:
+    return test_client.post(
         "/github",
         content=body,
         headers={
             "X-GitHub-Event": "workflow_job",
             "X-GitHub-Delivery": delivery,
-            "X-Hub-Signature-256": sign(body, "hook"),
+            "X-Hub-Signature-256": sign(body, HOOK),
             "Content-Type": "application/json",
         },
     )
 
 
-def test_workflow_event_requires_secret(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("WEBHOOK_SECRET", raising=False)
-    with pytest.raises(AuthError, match="WEBHOOK_SECRET"):
-        WorkflowJobEvent.from_request(b"{}", {})
+def test_workflow_event_requires_secret() -> None:
+    with pytest.raises(AuthError, match="webhook secret is required"):
+        WorkflowJobEvent.from_request(b"{}", {}, secret="")
 
 
 def test_workflow_event_bad_signature() -> None:
@@ -101,21 +114,20 @@ def test_workflow_event_bad_signature() -> None:
                 "x-github-event": "workflow_job",
                 "x-hub-signature-256": sign(body, "wrong"),
             },
-            secret="hook",
+            secret=HOOK,
         )
 
 
 def test_workflow_event_queued() -> None:
     body = queued_body()
-    secret = "hook"
     event = WorkflowJobEvent.from_request(
         body,
         {
             "x-github-event": "workflow_job",
             "x-github-delivery": "d1",
-            "x-hub-signature-256": sign(body, secret),
+            "x-hub-signature-256": sign(body, HOOK),
         },
-        secret=secret,
+        secret=HOOK,
     )
     assert event is not None
     assert event.repo == "acme/api"
@@ -130,9 +142,9 @@ def test_workflow_event_cancelled() -> None:
         {
             "x-github-event": "workflow_job",
             "x-github-delivery": "c1",
-            "x-hub-signature-256": sign(body, "hook"),
+            "x-hub-signature-256": sign(body, HOOK),
         },
-        secret="hook",
+        secret=HOOK,
     )
     assert event is not None
     assert event.action == "cancelled"
@@ -150,9 +162,9 @@ def test_workflow_event_ignores_completed() -> None:
             body,
             {
                 "x-github-event": "workflow_job",
-                "x-hub-signature-256": sign(body, "hook"),
+                "x-hub-signature-256": sign(body, HOOK),
             },
-            secret="hook",
+            secret=HOOK,
         )
         is None
     )
@@ -178,31 +190,31 @@ def test_try_claim_reclaims_stale_pending() -> None:
     store.put.assert_called_once()
 
 
-def test_github_webhook_200(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("WEBHOOK_SECRET", "hook")
+def test_github_webhook_200() -> None:
     fake_job = MagicMock()
     fake_job.object_id = "sb-ok"
+    runner = mock_runner()
+    gh = MagicMock()
+    runner.github_secret.return_value = gh
 
     with (
         patch.object(DeliveryStore, "__init__", lambda self, name: None),
         patch.object(DeliveryStore, "try_claim", return_value=None),
         patch.object(DeliveryStore, "mark_done") as mark_done,
-        patch("runner_modal.runner.Runner.from_name", return_value=mock_runner()),
-        patch("runner_modal.runner.Runner.Job.create", return_value=fake_job),
+        patch("runner_modal.runner.Runner.from_name", return_value=runner),
+        patch("runner_modal.runner.Runner.Job.create", return_value=fake_job) as create,
     ):
-        client = TestClient(WebhookApp.for_runner("acme"))
-        resp = post_github(client, queued_body(), delivery="deliv-1")
+        resp = post_github(client(), queued_body(), delivery="deliv-1")
         assert resp.status_code == 200
         assert resp.json() == {"object_id": "sb-ok", "name": "job-42"}
         mark_done.assert_called_once_with("deliv-1", "sb-ok")
+        assert create.call_args.kwargs["secret"] is gh
 
 
-def test_github_webhook_401_bad_hmac(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("WEBHOOK_SECRET", "hook")
+def test_github_webhook_401_bad_hmac() -> None:
     with patch.object(DeliveryStore, "__init__", lambda self, name: None):
-        client = TestClient(WebhookApp.for_runner("acme"))
         body = queued_body()
-        resp = client.post(
+        resp = client().post(
             "/github",
             content=body,
             headers={
@@ -215,23 +227,18 @@ def test_github_webhook_401_bad_hmac(monkeypatch: pytest.MonkeyPatch) -> None:
         assert resp.status_code == 401
 
 
-def test_github_webhook_204_when_ignored(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("WEBHOOK_SECRET", "hook")
-
+def test_github_webhook_204_when_ignored() -> None:
     with patch.object(DeliveryStore, "__init__", lambda self, name: None):
-        client = TestClient(WebhookApp.for_runner("acme"))
         payload = {
             "action": "completed",
             "workflow_job": {"id": 1, "run_id": 1, "labels": []},
             "repository": {"full_name": "a/b"},
         }
-        resp = post_github(client, json.dumps(payload).encode())
+        resp = post_github(client(), json.dumps(payload).encode())
         assert resp.status_code == 204
 
 
-def test_github_webhook_204_label_mismatch(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("WEBHOOK_SECRET", "hook")
-
+def test_github_webhook_204_label_mismatch() -> None:
     with (
         patch.object(DeliveryStore, "__init__", lambda self, name: None),
         patch(
@@ -240,17 +247,13 @@ def test_github_webhook_204_label_mismatch(monkeypatch: pytest.MonkeyPatch) -> N
         ),
         patch("runner_modal.runner.Runner.Job.create") as create,
     ):
-        client = TestClient(WebhookApp.for_runner("acme"))
-        resp = post_github(client, queued_body(labels=["modal"]))
+        resp = post_github(client(), queued_body(labels=["modal"]))
         assert resp.status_code == 204
         create.assert_not_called()
 
 
-def test_admission_hydrates_before_pool_check(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Regression: from_name alone leaves labels=[]; hydrate must run first."""
-    monkeypatch.setenv("WEBHOOK_SECRET", "hook")
+def test_admission_hydrates_before_pool_check() -> None:
+    """Regression: from_name alone leaves labels=[]; admits must hydrate first."""
     runner = mock_runner(labels=POOL_LABELS)
     assert runner.meta.labels == []
 
@@ -259,19 +262,14 @@ def test_admission_hydrates_before_pool_check(
         patch("runner_modal.runner.Runner.from_name", return_value=runner),
         patch("runner_modal.runner.Runner.Job.create") as create,
     ):
-        client = TestClient(WebhookApp.for_runner("acme"))
-        # Hosted-style labels must not spawn a Modal runner after hydrate.
-        resp = post_github(client, queued_body(labels=["ubuntu-latest"]))
+        resp = post_github(client(), queued_body(labels=["ubuntu-latest"]))
         assert resp.status_code == 204
+        runner.admits.assert_called()
         runner.hydrate.assert_called()
         create.assert_not_called()
 
 
-def test_admission_rejects_missing_self_hosted(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("WEBHOOK_SECRET", "hook")
-
+def test_admission_rejects_missing_self_hosted() -> None:
     with (
         patch.object(DeliveryStore, "__init__", lambda self, name: None),
         patch(
@@ -280,15 +278,12 @@ def test_admission_rejects_missing_self_hosted(
         ),
         patch("runner_modal.runner.Runner.Job.create") as create,
     ):
-        client = TestClient(WebhookApp.for_runner("acme"))
-        resp = post_github(client, queued_body(labels=["modal", "acme"]))
+        resp = post_github(client(), queued_body(labels=["modal", "acme"]))
         assert resp.status_code == 204
         create.assert_not_called()
 
 
-def test_admission_rejects_empty_pool(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("WEBHOOK_SECRET", "hook")
-
+def test_admission_rejects_empty_pool() -> None:
     with (
         patch.object(DeliveryStore, "__init__", lambda self, name: None),
         patch(
@@ -297,19 +292,22 @@ def test_admission_rejects_empty_pool(monkeypatch: pytest.MonkeyPatch) -> None:
         ),
         patch("runner_modal.runner.Runner.Job.create") as create,
     ):
-        client = TestClient(WebhookApp.for_runner("acme"))
-        resp = post_github(client, queued_body(labels=POOL_LABELS))
+        resp = post_github(client(), queued_body(labels=POOL_LABELS))
         assert resp.status_code == 204
         create.assert_not_called()
 
 
-def test_github_webhook_cancelled_terminates(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("WEBHOOK_SECRET", "hook")
+def test_github_webhook_cancelled_terminates() -> None:
     job = MagicMock()
     runner = mock_runner()
 
     def hydrate() -> None:
-        runner.meta = RunnerMeta(name="acme", labels=POOL_LABELS, app_name="acme-ci")
+        runner.meta = RunnerMeta(
+            name="acme",
+            labels=POOL_LABELS,
+            app_name="acme-ci",
+            secret_name="github-runner",
+        )
 
     runner.hydrate.side_effect = hydrate
 
@@ -321,8 +319,7 @@ def test_github_webhook_cancelled_terminates(monkeypatch: pytest.MonkeyPatch) ->
         ) as from_name,
         patch("runner_modal.runner.Runner.Job.create") as create,
     ):
-        client = TestClient(WebhookApp.for_runner("acme"))
-        resp = post_github(client, cancelled_body(job_id=99))
+        resp = post_github(client(), cancelled_body(job_id=99))
         assert resp.status_code == 204
         from_name.assert_called_once()
         assert from_name.call_args.args[:2] == ("acme-ci", "job-99")
@@ -330,12 +327,16 @@ def test_github_webhook_cancelled_terminates(monkeypatch: pytest.MonkeyPatch) ->
         create.assert_not_called()
 
 
-def test_github_webhook_cancelled_missing_job(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("WEBHOOK_SECRET", "hook")
+def test_github_webhook_cancelled_missing_job() -> None:
     runner = mock_runner()
 
     def hydrate() -> None:
-        runner.meta = RunnerMeta(name="acme", labels=POOL_LABELS, app_name="acme-ci")
+        runner.meta = RunnerMeta(
+            name="acme",
+            labels=POOL_LABELS,
+            app_name="acme-ci",
+            secret_name="github-runner",
+        )
 
     runner.hydrate.side_effect = hydrate
 
@@ -347,13 +348,11 @@ def test_github_webhook_cancelled_missing_job(monkeypatch: pytest.MonkeyPatch) -
             side_effect=LookupError("gone"),
         ),
     ):
-        client = TestClient(WebhookApp.for_runner("acme"))
-        resp = post_github(client, cancelled_body())
+        resp = post_github(client(), cancelled_body())
         assert resp.status_code == 204
 
 
-def test_github_webhook_duplicate_delivery(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("WEBHOOK_SECRET", "hook")
+def test_github_webhook_duplicate_delivery() -> None:
     done = DeliveryRecord(status="done", ts=1.0, object_id="sb-dup")
 
     with (
@@ -362,15 +361,13 @@ def test_github_webhook_duplicate_delivery(monkeypatch: pytest.MonkeyPatch) -> N
         patch("runner_modal.runner.Runner.from_name", return_value=mock_runner()),
         patch("runner_modal.runner.Runner.Job.create") as create,
     ):
-        client = TestClient(WebhookApp.for_runner("acme"))
-        resp = post_github(client, queued_body())
+        resp = post_github(client(), queued_body())
         assert resp.status_code == 200
         assert resp.json()["object_id"] == "sb-dup"
         create.assert_not_called()
 
 
-def test_github_webhook_503_when_pending(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("WEBHOOK_SECRET", "hook")
+def test_github_webhook_503_when_pending() -> None:
     pending = DeliveryRecord(status="pending", ts=1.0)
 
     with (
@@ -379,72 +376,68 @@ def test_github_webhook_503_when_pending(monkeypatch: pytest.MonkeyPatch) -> Non
         patch("runner_modal.runner.Runner.from_name", return_value=mock_runner()),
         patch("runner_modal.runner.Runner.Job.create") as create,
     ):
-        client = TestClient(WebhookApp.for_runner("acme"))
-        resp = post_github(client, queued_body())
+        resp = post_github(client(), queued_body())
         assert resp.status_code == 503
         create.assert_not_called()
 
 
-def test_github_webhook_503_when_full(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("WEBHOOK_SECRET", "hook")
-
+def test_github_webhook_503_when_full() -> None:
+    runner = mock_runner()
     with (
         patch.object(DeliveryStore, "__init__", lambda self, name: None),
         patch.object(DeliveryStore, "try_claim", return_value=None),
         patch.object(DeliveryStore, "release") as release,
-        patch("runner_modal.runner.Runner.from_name", return_value=mock_runner()),
+        patch("runner_modal.runner.Runner.from_name", return_value=runner),
         patch(
             "runner_modal.runner.Runner.Job.create",
             side_effect=ConcurrencyLimitError("full"),
         ),
     ):
-        client = TestClient(WebhookApp.for_runner("acme"))
-        resp = post_github(client, queued_body())
+        resp = post_github(client(), queued_body())
         assert resp.status_code == 503
         release.assert_called_once_with("d")
 
 
-def test_github_webhook_500_releases_claim(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("WEBHOOK_SECRET", "hook")
-
+def test_github_webhook_500_releases_claim() -> None:
+    runner = mock_runner()
     with (
         patch.object(DeliveryStore, "__init__", lambda self, name: None),
         patch.object(DeliveryStore, "try_claim", return_value=None),
         patch.object(DeliveryStore, "mark_done") as mark_done,
         patch.object(DeliveryStore, "release") as release,
-        patch("runner_modal.runner.Runner.from_name", return_value=mock_runner()),
+        patch("runner_modal.runner.Runner.from_name", return_value=runner),
         patch(
             "runner_modal.runner.Runner.Job.create",
             side_effect=RuntimeError("boom"),
         ),
     ):
-        client = TestClient(
-            WebhookApp.for_runner("acme"), raise_server_exceptions=False
+        test_client = TestClient(
+            WebhookApp.for_runner("acme", webhook_secret=HOOK),
+            raise_server_exceptions=False,
         )
-        resp = post_github(client, queued_body(), delivery="d-fail")
+        resp = post_github(test_client, queued_body(), delivery="d-fail")
         assert resp.status_code == 500
         mark_done.assert_not_called()
         release.assert_called_once_with("d-fail")
 
 
-def test_github_webhook_mark_done_failure_does_not_release(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("WEBHOOK_SECRET", "hook")
+def test_github_webhook_mark_done_failure_does_not_release() -> None:
     fake_job = MagicMock()
     fake_job.object_id = "sb-ok"
+    runner = mock_runner()
 
     with (
         patch.object(DeliveryStore, "__init__", lambda self, name: None),
         patch.object(DeliveryStore, "try_claim", return_value=None),
         patch.object(DeliveryStore, "mark_done", side_effect=RuntimeError("dict")),
         patch.object(DeliveryStore, "release") as release,
-        patch("runner_modal.runner.Runner.from_name", return_value=mock_runner()),
+        patch("runner_modal.runner.Runner.from_name", return_value=runner),
         patch("runner_modal.runner.Runner.Job.create", return_value=fake_job),
     ):
-        client = TestClient(
-            WebhookApp.for_runner("acme"), raise_server_exceptions=False
+        test_client = TestClient(
+            WebhookApp.for_runner("acme", webhook_secret=HOOK),
+            raise_server_exceptions=False,
         )
-        resp = post_github(client, queued_body())
+        resp = post_github(test_client, queued_body())
         assert resp.status_code == 500
         release.assert_not_called()

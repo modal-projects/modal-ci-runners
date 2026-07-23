@@ -12,17 +12,11 @@ from contextlib import contextmanager
 from pathlib import PurePosixPath
 from typing import ClassVar, Self
 
-import httpx
 import modal
-from pydantic import BaseModel, Field, ValidationError
-from tenacity import (
-    retry,
-    retry_if_exception_type,
-    stop_after_attempt,
-    wait_exponential,
-)
+from pydantic import BaseModel, Field
 
-from runner_modal.exceptions import AuthError, ConcurrencyLimitError, JobTimeoutError
+from runner_modal.exceptions import ConcurrencyLimitError, JobTimeoutError
+from runner_modal.job import JOB_SPEC_ENV, JobSpec
 from runner_modal.server import SERVER_CLASS_NAME, GitHubServer
 
 RUNNER_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,127}$")
@@ -31,6 +25,7 @@ KIND_TAG = "runner_modal"
 JOB_KIND = "runner"
 POOL_TAG = "runner_pool"
 DEFAULT_RUNNER_VERSION = "2.336.0"
+JOB_MODULE = "runner_modal.job"
 
 
 class RunnerMeta(BaseModel):
@@ -42,6 +37,11 @@ class RunnerMeta(BaseModel):
     cache: bool = True
     app_name: str | None = None
     server_name: str | None = None
+    # Named Modal Secret from Runner.create (GITHUB_TOKEN + WEBHOOK_SECRET).
+    secret_name: str | None = None
+    # Named Job Sandbox image published at Runner.create (``Image.from_name``).
+    job_image_name: str | None = None
+    github_enterprise_domain: str | None = None
     # Slim defaults applied by Job.create / webhook when kwargs are omitted.
     region: str | list[str] | None = None
     idle_timeout: int | None = None
@@ -61,82 +61,8 @@ class RunnerInfo(BaseModel):
     active_runners: int
     app_name: str | None
     server_name: str | None
-
-
-class JitResponse(BaseModel):
-    """GitHub generate-jitconfig JSON body."""
-
-    model_config = {"frozen": True}
-
-    encoded_jit_config: str
-
-
-class JitConfig(BaseModel):
-    """Encoded GitHub Actions JIT config."""
-
-    model_config = {"frozen": True}
-
-    encoded: str
-
-    @classmethod
-    def mint(
-        cls,
-        *,
-        repository: str,
-        labels: list[str],
-        token: str | None = None,
-        runner_group_id: int = 1,
-        name: str | None = None,
-    ) -> Self:
-        token = token or os.environ.get("GITHUB_TOKEN")
-        if not token:
-            raise AuthError("GITHUB_TOKEN is required to mint JIT config")
-        if repository.count("/") != 1:
-            raise ValueError(f"repository must be 'owner/repo', got {repository!r}")
-
-        owner, repo = repository.split("/", 1)
-        domain = os.environ.get("GITHUB_ENTERPRISE_DOMAIN")
-        base = f"https://{domain}/api/v3" if domain else "https://api.github.com"
-        url = f"{base}/repos/{owner}/{repo}/actions/runners/generate-jitconfig"
-        return cls(
-            encoded=cls.post(
-                url,
-                {
-                    "name": name or f"modal-{int(time.time())}",
-                    "runner_group_id": runner_group_id,
-                    "labels": labels,
-                },
-                {
-                    "Accept": "application/vnd.github+json",
-                    "Authorization": f"Bearer {token}",
-                    "X-GitHub-Api-Version": "2022-11-28",
-                    "User-Agent": "runner-modal",
-                },
-            )
-        )
-
-    @staticmethod
-    @retry(
-        retry=retry_if_exception_type(
-            (httpx.HTTPStatusError, httpx.TransportError, httpx.TimeoutException)
-        ),
-        stop=stop_after_attempt(4),
-        wait=wait_exponential(multiplier=1, min=1, max=8),
-        reraise=True,
-    )
-    def post(url: str, payload: dict[str, object], headers: dict[str, str]) -> str:
-        resp = httpx.post(url, json=payload, headers=headers, timeout=30.0)
-        if resp.status_code in (401, 403):
-            raise AuthError(f"generate-jitconfig: HTTP {resp.status_code}")
-        if resp.status_code >= 500:
-            resp.raise_for_status()
-        if resp.status_code >= 400:
-            raise ValueError(f"generate-jitconfig: HTTP {resp.status_code}")
-        try:
-            body = JitResponse.model_validate(resp.json())
-        except ValidationError as e:
-            raise ValueError("generate-jitconfig: missing encoded_jit_config") from e
-        return body.encoded_jit_config
+    secret_name: str | None
+    job_image_name: str | None
 
 
 class RunnerObjects:
@@ -299,12 +225,13 @@ class Runner:
             cls,
             runner: Runner,
             *,
+            repository: str,
+            secret: modal.Secret,
             app: modal.App | None = None,
-            repository: str | None = None,
-            jit_config: str | None = None,
             labels: Sequence[str] | None = None,
             runner_group_id: int | None = None,
             runner_name: str | None = None,
+            github_enterprise_domain: str | None = None,
             image: modal.Image | None = None,
             env: dict[str, str | None] | None = None,
             secrets: Collection[modal.Secret] | None = None,
@@ -332,13 +259,12 @@ class Runner:
         ) -> Runner.Job:
             """Create a job Sandbox (eager) — same role as ``modal.Sandbox.create``.
 
-            Resource knobs are Modal-flat (``cpu`` / ``memory`` / ``gpu`` /
-            ``experimental_options``). JIT mint reads ``GITHUB_TOKEN`` from the
-            *calling* process env (or pass ``jit_config=``); Sandbox ``secrets=``
-            do not authenticate mint.
+            ``secret`` must provide ``GITHUB_TOKEN`` (typically
+            ``Secret.from_name(..., required_keys=["GITHUB_TOKEN"])``). JIT mint
+            runs inside the Sandbox via ``python -m runner_modal.job``.
             """
-            if jit_config is None and repository is None:
-                raise ValueError("Job.create requires repository= or jit_config=")
+            if repository.count("/") != 1:
+                raise ValueError(f"repository must be 'owner/repo', got {repository!r}")
 
             runner.hydrate()
             if not runner.has_capacity():
@@ -348,6 +274,9 @@ class Runner:
                 )
 
             merged_labels = list(dict.fromkeys([*(labels or []), *runner.meta.labels]))
+            if not merged_labels:
+                raise ValueError("Job.create requires non-empty labels")
+
             group_id = (
                 runner_group_id
                 if runner_group_id is not None
@@ -359,68 +288,61 @@ class Runner:
             )
             exp = dict(runner.meta.experimental_options or {})
             exp.update(experimental_options or {})
-
-            if jit_config is None:
-                if repository is None:
-                    raise ValueError("Job.create requires repository= or jit_config=")
-                jit_config = JitConfig.mint(
-                    repository=repository,
-                    labels=merged_labels or ["self-hosted", "modal"],
-                    runner_group_id=group_id,
-                    name=runner_name or name,
-                ).encoded
+            domain = (
+                github_enterprise_domain
+                if github_enterprise_domain is not None
+                else runner.meta.github_enterprise_domain
+            )
 
             use_docker = bool(exp.get("vm_runtime"))
             if image is None:
-                image = Runner.docker_image() if use_docker else Runner.default_image()
+                if runner.meta.job_image_name:
+                    image = modal.Image.from_name(
+                        runner.meta.job_image_name,
+                        environment_name=environment_name or runner.environment_name,
+                        client=client or runner.client,
+                    )
+                else:
+                    # Imperative / objects-only: build from this uv project (repo root).
+                    image = (
+                        Runner.docker_image() if use_docker else Runner.default_image()
+                    )
 
             vol_map: dict[
                 str | os.PathLike[str], modal.Volume | modal.CloudBucketMount
             ] = dict(volumes) if volumes else {}
-            if runner.volume is not None and not any(
-                str(path) == "/cache" for path in vol_map
-            ):
+            if runner.volume is not None and "/cache" not in {
+                str(path) for path in vol_map
+            }:
                 vol_map["/cache"] = runner.volume
 
             merged_tags: dict[str, str] = {
                 **(tags or {}),
                 KIND_TAG: JOB_KIND,
                 POOL_TAG: runner.name,
+                "repository": repository.replace("/", "_"),
             }
-            if repository:
-                merged_tags["repository"] = repository.replace("/", "_")
 
+            spec = JobSpec(
+                repository=repository,
+                labels=merged_labels,
+                runner_group_id=group_id,
+                runner_name=runner_name or name or f"modal-{int(time.time())}",
+                github_enterprise_domain=domain,
+                use_docker=use_docker,
+            )
             run_env = dict(env or {})
             run_env.setdefault("RUNNER_ALLOW_RUNASROOT", "1")
-            merged_secrets = [
-                *(secrets or []),
-                modal.Secret.from_dict({"MODAL_RUNNER_JIT": jit_config}),
-            ]
-
-            if use_docker:
-                entrypoint = (
-                    "bash",
-                    "-lc",
-                    (
-                        "dockerd -D >/var/log/dockerd.log 2>&1 & "
-                        "for i in $(seq 1 120); do "
-                        "docker info >/dev/null 2>&1 && break; sleep 1; done; "
-                        'cd /actions-runner && ./run.sh --jitconfig "$MODAL_RUNNER_JIT"'
-                    ),
-                )
-            else:
-                entrypoint = (
-                    "bash",
-                    "-lc",
-                    'cd /actions-runner && ./run.sh --jitconfig "$MODAL_RUNNER_JIT"',
-                )
+            run_env[JOB_SPEC_ENV] = spec.model_dump_json()
 
             sandbox = modal.Sandbox.create(
-                *entrypoint,
+                "python",
+                "-m",
+                JOB_MODULE,
                 app=app,
                 image=image,
                 env=run_env,
-                secrets=merged_secrets,
+                secrets=[secret, *(secrets or [])],
                 volumes=vol_map,
                 timeout=timeout,
                 idle_timeout=job_idle,
@@ -479,23 +401,44 @@ class Runner:
 
     @classmethod
     def control_plane_image(cls) -> modal.Image:
-        """Slim Server image — installs the ``runner-modal`` package."""
-        return modal.Image.debian_slim(python_version="3.12").uv_pip_install(
-            "runner-modal"
+        """Server image — uv project deps + local ``runner_modal`` (repo root)."""
+        return (
+            modal.Image.debian_slim(python_version="3.12")
+            .uv_sync()
+            .add_local_python_source("runner_modal")
+        )
+
+    @classmethod
+    def install_actions_runner(
+        cls, image: modal.Image, *, runner_version: str = DEFAULT_RUNNER_VERSION
+    ) -> modal.Image:
+        """Layer the GitHub Actions runner binary onto an image."""
+        return image.run_commands(
+            f"curl -fsSL -o /tmp/actions-runner.tar.gz "
+            f"https://github.com/actions/runner/releases/download/"
+            f"v{runner_version}/actions-runner-linux-x64-{runner_version}.tar.gz",
+            "mkdir -p /actions-runner",
+            "tar -xzf /tmp/actions-runner.tar.gz -C /actions-runner",
+            "rm /tmp/actions-runner.tar.gz",
+            "chmod +x /actions-runner/run.sh /actions-runner/config.sh",
         )
 
     @classmethod
     def default_image(
         cls, *, runner_version: str = DEFAULT_RUNNER_VERSION
     ) -> modal.Image:
-        """gVisor job image with Actions runner (CPU/GPU)."""
-        return (
+        """gVisor job image with Actions runner (CPU/GPU).
+
+        Call from the repo root so ``uv_sync()`` sees this uv project.
+        ``uv_sync()`` installs lockfile deps only; ``add_local_python_source``
+        (``copy=True``, last) bakes ``runner_modal`` into the published Image.
+        """
+        base = (
             modal.Image.debian_slim(python_version="3.12")
             .apt_install(
                 "curl",
                 "ca-certificates",
                 "git",
-                "jq",
                 "libicu-dev",
                 "liblttng-ust1",
                 "libssl3",
@@ -503,31 +446,28 @@ class Runner:
                 "unzip",
                 "zip",
             )
-            .run_commands(
-                f"curl -fsSL -o /tmp/actions-runner.tar.gz "
-                f"https://github.com/actions/runner/releases/download/"
-                f"v{runner_version}/actions-runner-linux-x64-{runner_version}.tar.gz",
-                "mkdir -p /actions-runner",
-                "tar -xzf /tmp/actions-runner.tar.gz -C /actions-runner",
-                "rm /tmp/actions-runner.tar.gz",
-                "chmod +x /actions-runner/run.sh /actions-runner/config.sh",
-            )
+            .uv_sync()
             .env({"RUNNER_ALLOW_RUNASROOT": "1"})
+        )
+        return cls.install_actions_runner(
+            base, runner_version=runner_version
+        ).add_local_python_source(
+            "runner_modal",
+            copy=True,
         )
 
     @classmethod
     def docker_image(
         cls, *, runner_version: str = DEFAULT_RUNNER_VERSION
     ) -> modal.Image:
-        """VM job image with dockerd (no GPU)."""
-        return (
+        """VM job image with dockerd (no GPU). Deploy/run from the repo root."""
+        base = (
             modal.Image.from_registry("ubuntu:24.04")
             .env({"DEBIAN_FRONTEND": "noninteractive", "RUNNER_ALLOW_RUNASROOT": "1"})
             .apt_install(
                 "curl",
                 "ca-certificates",
                 "git",
-                "jq",
                 "docker.io",
                 "docker-buildx",
                 "libicu-dev",
@@ -535,15 +475,13 @@ class Runner:
                 "unzip",
                 "zip",
             )
-            .run_commands(
-                f"curl -fsSL -o /tmp/actions-runner.tar.gz "
-                f"https://github.com/actions/runner/releases/download/"
-                f"v{runner_version}/actions-runner-linux-x64-{runner_version}.tar.gz",
-                "mkdir -p /actions-runner",
-                "tar -xzf /tmp/actions-runner.tar.gz -C /actions-runner",
-                "rm /tmp/actions-runner.tar.gz",
-                "chmod +x /actions-runner/run.sh /actions-runner/config.sh",
-            )
+            .uv_sync()
+        )
+        return cls.install_actions_runner(
+            base, runner_version=runner_version
+        ).add_local_python_source(
+            "runner_modal",
+            copy=True,
         )
 
     @classmethod
@@ -552,11 +490,11 @@ class Runner:
         app: modal.App,
         name: str,
         *,
+        secret: modal.Secret,
         labels: Sequence[str] | None = None,
         max_concurrent: int | None = None,
         cache: bool = True,
         image: modal.Image | None = None,
-        secrets: Collection[modal.Secret] | None = None,
         volumes: Mapping[str | PurePosixPath, modal.Volume | modal.CloudBucketMount]
         | None = None,
         env: dict[str, str | None] | None = None,
@@ -582,23 +520,34 @@ class Runner:
         idle_timeout: int | None = None,
         experimental_options: dict[str, object] | None = None,
         runner_group_id: int | None = None,
+        github_enterprise_domain: str | None = None,
     ) -> Self:
         """Register control plane on ``app`` (definition-time — not a Sandbox).
 
         Call once per App. Runner ``name`` identifies Dict/Volume state; the Modal
         Server class is always ``GitHubServer`` (Modal has no Server parameters).
 
+        ``secret`` must be a named Secret (``Secret.from_name``) with
+        ``GITHUB_TOKEN`` and ``WEBHOOK_SECRET``. The name is persisted so the
+        webhook can pass the same Secret into ``Job.create``.
+
+        Job Sandbox images are built and published here as a named Image
+        (``"{name}-job"``) via ``Image.build`` + ``publish``, so the Server can
+        ``Image.from_name`` without reconstructing local ``uv_sync`` mounts.
+
         ``cache=True`` mounts a shared Volume at ``/cache`` on job Sandboxes — this is
         not the GitHub Actions cache service (``actions/cache``).
-
-        Optional ``compute_region``, ``idle_timeout``, ``experimental_options``, and
-        ``runner_group_id`` are stored as slim Job defaults for omitted kwargs.
         """
         if not RUNNER_NAME_RE.fullmatch(name):
             raise ValueError(f"invalid Runner name {name!r}")
         if not app.name:
             raise ValueError(
                 "Runner.create requires a named App, e.g. modal.App('acme-ci')"
+            )
+        secret_name = secret.name
+        if not secret_name:
+            raise ValueError(
+                "Runner.create requires a named Secret (modal.Secret.from_name)"
             )
 
         runner = cls.from_name(
@@ -610,38 +559,59 @@ class Runner:
             cache=cache,
             client=client,
         )
-        region_default: str | list[str] | None
+        runner.hydrate()
+        prior = runner.meta
         if compute_region is None:
-            region_default = runner.meta.region
+            region_default: str | list[str] | None = prior.region
         elif isinstance(compute_region, str):
             region_default = compute_region
         else:
             region_default = list(compute_region)
 
+        exp = (
+            dict(experimental_options)
+            if experimental_options is not None
+            else dict(prior.experimental_options or {})
+        )
+        job_image_name = f"{name}-job"
+        recipe = cls.docker_image() if exp.get("vm_runtime") else cls.default_image()
+        build_app = modal.App.lookup(
+            app.name,
+            create_if_missing=True,
+            environment_name=environment_name,
+            client=client,
+        )
+        recipe.build(build_app).publish(
+            job_image_name,
+            environment_name=environment_name,
+            client=client,
+        )
+
         runner.meta = RunnerMeta(
-            name=runner.meta.name,
-            labels=list(labels) if labels is not None else list(runner.meta.labels),
+            name=name,
+            labels=list(labels) if labels is not None else list(prior.labels),
             max_concurrent=(
-                max_concurrent
-                if max_concurrent is not None
-                else runner.meta.max_concurrent
+                max_concurrent if max_concurrent is not None else prior.max_concurrent
             ),
             cache=cache,
             app_name=app.name,
             server_name=SERVER_CLASS_NAME,
+            secret_name=secret_name,
+            job_image_name=job_image_name,
+            github_enterprise_domain=(
+                github_enterprise_domain
+                if github_enterprise_domain is not None
+                else prior.github_enterprise_domain
+            ),
             region=region_default,
             idle_timeout=(
-                idle_timeout if idle_timeout is not None else runner.meta.idle_timeout
+                idle_timeout if idle_timeout is not None else prior.idle_timeout
             ),
-            experimental_options=(
-                dict(experimental_options)
-                if experimental_options is not None
-                else runner.meta.experimental_options
-            ),
+            experimental_options=exp or None,
             runner_group_id=(
                 runner_group_id
                 if runner_group_id is not None
-                else runner.meta.runner_group_id
+                else prior.runner_group_id
             ),
         )
         runner.persist_meta()
@@ -661,7 +631,7 @@ class Runner:
 
         app.server(
             image=image if image is not None else cls.control_plane_image(),
-            secrets=list(secrets) if secrets is not None else None,
+            secrets=[secret],
             volumes=vol_map,
             env=run_env,
             compute_region=compute_region,
@@ -764,15 +734,12 @@ class Runner:
                     raise LookupError(f"Runner {self.name!r} meta init race")
                 self.meta = RunnerMeta.model_validate(existing)
         else:
-            loaded = RunnerMeta.model_validate(existing)
-            app_name = self.meta.app_name or loaded.app_name
-            server_name = self.meta.server_name or loaded.server_name
-            self.meta = loaded.model_copy(
-                update={"app_name": app_name, "server_name": server_name}
-            )
-            if app_name != loaded.app_name or server_name != loaded.server_name:
-                self.persist_meta()
+            self.meta = RunnerMeta.model_validate(existing)
 
+        self.bind_volume()
+        self.hydrated = True
+
+    def bind_volume(self) -> None:
         if self.meta.cache:
             self.volume = modal.Volume.from_name(
                 f"{self.name}-cache",
@@ -782,14 +749,41 @@ class Runner:
             )
         else:
             self.volume = None
-        self.hydrated = True
 
     def persist_meta(self) -> None:
+        """Write ``self.meta`` to the Dict (does not reload over local meta)."""
+        if self.meta_dict is None:
+            self.meta_dict = modal.Dict.from_name(
+                f"{self.name}-runner-meta",
+                environment_name=self.environment_name,
+                create_if_missing=True,
+                client=self.client,
+            )
+        self.meta_dict[META_KEY] = self.meta.model_dump(mode="json")
+        self.bind_volume()
+        self.hydrated = True
+
+    def github_secret(self) -> modal.Secret:
+        """Named Secret for Job JIT mint (``GITHUB_TOKEN``)."""
         self.hydrate()
-        meta_dict = self.meta_dict
-        if meta_dict is None:
-            raise RuntimeError(f"Runner {self.name!r} meta store missing after hydrate")
-        meta_dict[META_KEY] = self.meta.model_dump(mode="json")
+        if not self.meta.secret_name:
+            raise LookupError(
+                f"Runner {self.name!r} has no secret_name; "
+                "call Runner.create(secret=...) first"
+            )
+        return modal.Secret.from_name(
+            self.meta.secret_name,
+            required_keys=["GITHUB_TOKEN"],
+            environment_name=self.environment_name,
+            client=self.client,
+        )
+
+    def admits(self, labels: Sequence[str]) -> bool:
+        """Whether webhook labels match this pool (after hydrate)."""
+        self.hydrate()
+        pool = set(self.meta.labels)
+        job_labels = set(labels)
+        return bool(pool) and "self-hosted" in job_labels and pool <= job_labels
 
     @property
     def url(self) -> str | None:
@@ -839,4 +833,6 @@ class Runner:
             active_runners=self.active_count(app_id=app_id),
             app_name=self.meta.app_name,
             server_name=self.meta.server_name,
+            secret_name=self.meta.secret_name,
+            job_image_name=self.meta.job_image_name,
         )

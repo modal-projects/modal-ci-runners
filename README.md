@@ -2,22 +2,17 @@
 
 Self-hosted [GitHub Actions](https://docs.github.com/en/actions) runners on [Modal](https://modal.com).
 
-One public type — `Runner` — registers a webhook control plane. Jobs run as Modal Sandboxes with the official Actions runner binary. The API mirrors Modal entities (`Runner` ≈ Volume + Server; `Runner.Job` ≈ Sandbox).
+One public type — `Runner` — registers a webhook control plane. Jobs run as Modal Sandboxes via `python -m runner_modal.job`. The API mirrors Modal entities (`Runner` ≈ Volume + Server; `Runner.Job` ≈ Sandbox).
 
 ## Requirements
 
 - Python >= 3.12
 - A [Modal](https://modal.com) account and CLI
-- A GitHub token that can mint JIT runner configs
-- A webhook secret for `POST /github`
+- A named Modal Secret with `GITHUB_TOKEN` and `WEBHOOK_SECRET`
 
 ## Installation
 
-```bash
-uv add runner-modal
-```
-
-From this repo:
+From this repo (uv project — deploy and `modal run` from the repo root):
 
 ```bash
 uv sync
@@ -33,16 +28,16 @@ modal secret create github-runner \
   WEBHOOK_SECRET=$(openssl rand -hex 32)
 ```
 
-| Key | Used by | Purpose |
-|-----|---------|---------|
-| `GITHUB_TOKEN` | Process that calls `Job.create` (the Server after deploy) | Mint JIT runner configs |
-| `WEBHOOK_SECRET` | Server | Verify GitHub HMAC on `/github` |
+| Key | Where | Purpose |
+|-----|--------|---------|
+| `GITHUB_TOKEN` | Job Sandbox (`Job.create(secret=…)`) | Mint JIT inside the job |
+| `WEBHOOK_SECRET` | Server (`Runner.create(secret=…)`) | HMAC on `POST /github` |
 
-Job Sandbox `secrets=` do **not** authenticate parent-side JIT mint. Pass the token into the Server (or local) env.
+`secret=` must be a **named** Secret (`modal.Secret.from_name`). There are no credential env fallbacks.
 
 ### 2. Deploy the control plane
 
-From the repo root (so `uv_sync()` sees the project):
+From the repo root so `uv_sync()` / `add_local_python_source("runner_modal")` see the project:
 
 ```bash
 modal deploy examples/github_webhook.py
@@ -53,13 +48,15 @@ import modal
 from runner_modal import Runner
 
 app = modal.App("acme-ci")
-gh = modal.Secret.from_name("github-runner")
+gh = modal.Secret.from_name(
+    "github-runner",
+    required_keys=["GITHUB_TOKEN", "WEBHOOK_SECRET"],
+)
 
 runner = Runner.create(
     app=app,
     name="acme",
-    image=modal.Image.debian_slim(python_version="3.12").uv_sync(),
-    secrets=[gh],
+    secret=gh,
     compute_region="us-east",
     labels=["self-hosted", "modal", "acme"],
     max_concurrent=20,
@@ -67,17 +64,19 @@ runner = Runner.create(
 )
 ```
 
-Call `Runner.create` **once per App**. The Modal Server class is always `GitHubServer`; the runner `name` selects Dict/Volume/delivery state via `RUNNER_MODAL_NAME`.
+`Runner.create` builds and publishes the job Sandbox image as a named Image (`"{name}-job"`) via `Image.build` + `publish`, and persists `job_image_name` next to `secret_name`. The Server later uses `Image.from_name` — it does not rebuild local mounts.
+
+Call `Runner.create` **once per App**. The Server class is always `GitHubServer`; identity is `RUNNER_MODAL_NAME` + persisted meta.
 
 ### 3. Point GitHub at the webhook
 
 ```python
 runner = Runner.from_name("acme")
 print(runner.url)  # None until the Server is ready
-# Webhook URL: {runner.url}/github
+# Webhook: {runner.url}/github
 ```
 
-In the workflow, include every pool label plus a unique label so one runner maps to one job:
+Workflow labels must include every pool label plus a unique pin:
 
 ```yaml
 runs-on:
@@ -90,55 +89,64 @@ runs-on:
 ## How it works
 
 ```text
-GitHub  --workflow_job-->  GitHubServer (FastAPI)
-                                |
-                         claim delivery ID
-                                |
-                         mint JIT + Sandbox.create
-                                |
-                         actions-runner --jitconfig ...
-                                |
-                         picks up the labeled job
+GitHub  --workflow_job-->  GitHubServer
+                              │
+                       claim delivery ID
+                              │
+                       Job.create(secret=from_name(secret_name),
+                                  image=from_name(job_image_name))
+                              │
+                       python -m runner_modal.job
+                              │
+                       mint JIT from GITHUB_TOKEN
+                              │
+                       ./run.sh --jitconfig …
 ```
 
 | Piece | Modal object | Role |
 |-------|--------------|------|
-| Pool config | Dict `{name}-runner-meta` | Labels, capacity, app/server names, job defaults |
-| Webhook idempotency | Dict `{name}-runner-deliveries` | Claim delivery **before** create |
-| Optional scratch | Volume `{name}-cache` → `/cache` | Shared across jobs; **not** `actions/cache` |
+| Meta | Dict `{name}-runner-meta` | Labels, capacity, `secret_name`, `job_image_name`, defaults |
+| Deliveries | Dict `{name}-runner-deliveries` | Claim **before** create |
+| Cache | Volume `{name}-cache` → `/cache` | Optional scratch — **not** `actions/cache` |
 | Control plane | Server `GitHubServer` | HMAC, admission, create/cancel |
-| Job | Sandbox | Runs `/actions-runner/run.sh` |
+| Credentials | Named `modal.Secret` | Required on `Runner.create` and `Job.create` |
+| Job | Sandbox | `python -m runner_modal.job` |
 
-Two paths share `Runner.Job.create`:
+Paths: webhook ([`examples/github_webhook.py`](examples/github_webhook.py)) and imperative ([`examples/imperative_create.py`](examples/imperative_create.py)).
 
-- **Webhook** — GitHub `queued` / `cancelled` events (production CI)
-- **Imperative** — call `Job.create` from your process ([`examples/imperative_create.py`](examples/imperative_create.py))
+## Secrets
+
+- **Required, explicit.** Pass `secret=` on create — never rely on ambient `GITHUB_TOKEN` / `WEBHOOK_SECRET` in the parent process.
+- **Named only.** `Secret.from_name(...)` so the name can be persisted and reattached for webhook jobs.
+- **Roles.** Same Secret usually holds both keys: Server uses `WEBHOOK_SECRET`; each Job is given the Secret for `GITHUB_TOKEN` mint.
+- **No tokens in `env=`.** Job inputs use `RUNNER_JOB_SPEC` JSON; JIT never goes in plain env.
 
 ## Label admission
 
-After each webhook, the Server hydrates Runner meta from the Dict, then admits a job only when:
+Webhook hydrates Runner meta, then admits only when:
 
-1. The job labels include `self-hosted`
+1. Job labels include `self-hosted`
 2. Pool labels are non-empty
-3. Every pool label appears on the job (`pool ⊆ job.labels`)
+3. `pool ⊆ job.labels`
 
-Empty pool labels admit **no** jobs. Extra job labels (for example a unique `job-…` pin) are fine.
+Empty pool → admit nothing. Extra labels (e.g. unique `job-…`) are fine.
 
 ## Security notes
 
-Self-hosted runners execute workflow code with access to the runner environment. Treat fork PRs and untrusted workflows as hostile. Prefer private repos or trusted branches, and do not expose a shared org webhook until you understand that blast radius.
-
-Never put `GITHUB_TOKEN`, `WEBHOOK_SECRET`, or JIT strings in Sandbox `env=`. JIT is passed as a Modal Secret (`MODAL_RUNNER_JIT`).
+Self-hosted runners execute workflow code with access to the runner environment. Treat fork PRs and untrusted workflows as hostile. Prefer private repos or trusted branches before exposing a shared org webhook.
 
 ## Imperative jobs
 
-JIT mint still needs `GITHUB_TOKEN` in the **local** process:
+`Job.create` always needs an explicit `secret=` (even if you used `Runner.objects.create` without a webhook deploy):
 
 ```python
+gh = modal.Secret.from_name("github-runner", required_keys=["GITHUB_TOKEN"])
+
 job = Runner.Job.create(
     runner,
     repository="acme/api",
     labels=["modal", "acme", "job-1"],
+    secret=gh,
     gpu="t4",
 )
 job.wait()
@@ -150,6 +158,7 @@ Docker / VM (no GPU):
 Runner.Job.create(
     runner,
     repository="acme/api",
+    secret=gh,
     experimental_options={"vm_runtime": True},
 )
 ```
@@ -158,31 +167,31 @@ Runner.Job.create(
 
 | Call | Modal analogue | What |
 |------|----------------|------|
-| `Runner.create(app, name, …)` | `@app.server` | Definition-time control plane |
+| `Runner.create(app, name, secret=…)` | `@app.server` | Definition-time control plane |
 | `Runner.from_name` / `objects` / `ephemeral` | `Volume.*` | Named handle + admin |
 | `runner.url` | `Server.get_url()` | `str \| None` until ready |
-| `Runner.Job.create(runner, …)` | `Sandbox.create` | Eager job Sandbox |
+| `Runner.Job.create(…, repository=…, secret=…)` | `Sandbox.create` | Eager job Sandbox |
 | `Runner.Job.from_id` / `from_name` / `wait` | `Sandbox.*` | Lookup / block |
 | `POST {url}/github` | — | Claim → create → 200 / 204 / 5xx |
 
-Resource knobs on jobs are Modal-flat: `cpu`, `memory`, `gpu`, `experimental_options`.
+Job resources are Modal-flat: `cpu`, `memory`, `gpu`, `experimental_options`.
 
 ## Errors vs soft absence
 
-Soft miss → `None` or HTTP 204. Real failures raise.
+Soft miss → `None` or HTTP 204. Failures raise.
 
 | Situation | Result |
 |-----------|--------|
 | Undeployed / no URL yet | `runner.url is None` |
-| Ignored webhook (wrong event, labels, …) | HTTP 204 |
-| Bad name / repo / missing Job args | `ValueError` |
-| Missing named Runner meta | `LookupError` |
-| Bad HMAC / missing token | `AuthError` |
+| Ignored webhook | HTTP 204 |
+| Bad name / repo | `ValueError` |
+| Missing Runner meta | `LookupError` |
+| Bad HMAC / empty webhook secret | `AuthError` |
 | At `max_concurrent` | `ConcurrencyLimitError` |
 | Delivery in progress / capacity | HTTP 503 |
 | `job.wait(timeout=…)` exceeded | `JobTimeoutError` |
 
-`has_capacity()` is a soft list-then-create check — concurrent creators can overshoot. It is not a linearizable lock.
+`has_capacity()` is soft list-then-create — not a lock; concurrent creators can overshoot.
 
 ## Development
 
@@ -194,7 +203,7 @@ uv run ruff format --check src/runner_modal tests examples
 uv run ty check
 ```
 
-Layout: `src/runner_modal/` (`runner`, `api`, `server`, `exceptions`); one unit test file per module under `tests/unit/`. Contributor conventions: [`AGENTS.md`](AGENTS.md).
+Layout: `src/runner_modal/` (`runner`, `job`, `api`, `server`, `exceptions`). Conventions: [`AGENTS.md`](AGENTS.md).
 
 ## License
 
