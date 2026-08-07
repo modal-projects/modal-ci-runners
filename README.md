@@ -114,6 +114,75 @@ GitHub  --workflow_job-->  GitHubServer
 
 Paths: webhook ([`examples/github_webhook.py`](examples/github_webhook.py)) and imperative ([`examples/imperative_create.py`](examples/imperative_create.py)).
 
+## Performance
+
+People evaluating CI runners usually care about a small set of metrics — not package install times or pytest duration (those are the job’s problem).
+
+| Metric | Question it answers |
+|--------|---------------------|
+| **Queue / wait** | How long from `queued` until the first workflow step runs? |
+| **Time to runner online** | How long until GitHub sees an `online` runner for this job? |
+| **Cold vs warm** | Is the first job after deploy/idle much slower than the next? |
+| **Concurrency** | Can *N* jobs start together, or do they serialize behind capacity? |
+| **Idle cost** | What do you pay when nothing is running? |
+
+**Queue** is `queued → first step`. Workflow duration after that is mostly independent of the runner host.
+
+Critical path: admit → `Sandbox.create` → mint JIT in the job → runner online → first step → done.
+
+### vs GitHub-hosted
+
+Same metric: time until a runner is ready. Chart values are order-of-magnitude samples (warm control plane), not an SLA.
+
+![Time to runner ready](docs/time-to-ready.png)
+
+| Path | Ready in | What we timed |
+|------|----------|----------------|
+| **GitHub-hosted** (`ubuntu-latest`) | **~3 s** | `run.created` → `job.started` |
+| **runner-modal** (warm Named Image) | **~4 s** | webhook → GitHub runner `online` |
+| **runner-modal** (cold image rebuild) | **~30 s** | rebuilding Actions runner layers on the request |
+
+Warm Modal lands near GitHub-hosted. `Runner.create` publishes `{name}-job` so the webhook path uses `Image.from_name`.
+
+### Where warm queue time goes
+
+![Warm queue budget](docs/queue-budget.png)
+
+| Stage | Role |
+|-------|------|
+| Admit / claim | Webhook HMAC, label check, delivery idempotency |
+| Sandbox create | Schedule the job container |
+| JIT mint (in job) | GitHub `generate-jitconfig` from Secret |
+| Runner online | Actions `run.sh` registers with GitHub |
+
+### Concurrency / burst
+
+With headroom under `max_concurrent`, jobs start as parallel Sandboxes — time-to-ready stays flat as N grows. If effective concurrency is 1, wait stacks.
+
+![Concurrency / burst](docs/concurrency.png)
+
+`max_concurrent` is a **soft** list-then-create check (TOCTOU). Concurrent creators can briefly overshoot.
+
+### Idle cost
+
+GitHub-hosted has no idle bill. Modal keeps a small control plane (`min_containers`); each job is an ephemeral Sandbox that stops with the run.
+
+![Idle vs active cost](docs/idle-cost.png)
+
+Regenerate charts:
+
+```bash
+uv run --group dev python scripts/charts.py
+```
+
+Profile the hot path:
+
+```bash
+modal run scripts/profile.py --with-job --with-online --repository owner/repo
+```
+
+Set `RUNNER_MODAL_PROFILE=1` on the Server to print stage timers in Modal logs.
+
 ## Secrets
 
 - **Required, explicit.** Pass `secret=` on create — never rely on ambient `GITHUB_TOKEN` / `WEBHOOK_SECRET` in the parent process.
