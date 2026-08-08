@@ -15,8 +15,9 @@ class StageClock:
         with StageClock("hydrate"):
             runner.hydrate()
 
-    ``ms`` is set on exit (0 when profiling is off). The harness in
-    ``scripts/profile.py`` reuses this entity — do not add a parallel timer.
+    ``ms`` is set on exit (0 when profiling is off). Used by the webhook /
+    ``Job.create`` path, inside ``python -m runner_modal.job``, and by
+    ``scripts/profile.py``.
     """
 
     ENV = "RUNNER_MODAL_PROFILE"

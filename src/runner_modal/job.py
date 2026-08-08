@@ -22,6 +22,7 @@ from tenacity import (
 )
 
 from runner_modal.exceptions import AuthError
+from runner_modal.profile import StageClock
 
 JOB_SPEC_ENV = "RUNNER_JOB_SPEC"
 ACTIONS_RUNNER = "/actions-runner/run.sh"
@@ -141,15 +142,18 @@ def boot_docker() -> None:
 
 def run(spec: JobSpec, *, token: str) -> None:
     if spec.use_docker:
-        boot_docker()
-    jit = mint_jitconfig(
-        repository=spec.repository,
-        labels=spec.labels,
-        token=token,
-        runner_group_id=spec.runner_group_id,
-        name=spec.runner_name,
-        github_enterprise_domain=spec.github_enterprise_domain,
-    )
+        with StageClock("boot_docker"):
+            boot_docker()
+    with StageClock("jit_mint"):
+        jit = mint_jitconfig(
+            repository=spec.repository,
+            labels=spec.labels,
+            token=token,
+            runner_group_id=spec.runner_group_id,
+            name=spec.runner_name,
+            github_enterprise_domain=spec.github_enterprise_domain,
+        )
+    # run.sh replaces this process — no stage timer after exec.
     os.execv(ACTIONS_RUNNER, [ACTIONS_RUNNER, "--jitconfig", jit])
 
 

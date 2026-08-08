@@ -17,6 +17,7 @@ from pydantic import BaseModel, Field
 
 from runner_modal.exceptions import ConcurrencyLimitError, JobTimeoutError
 from runner_modal.job import JOB_SPEC_ENV, JobSpec
+from runner_modal.profile import StageClock
 from runner_modal.server import SERVER_CLASS_NAME, GitHubServer
 
 RUNNER_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,127}$")
@@ -267,11 +268,12 @@ class Runner:
                 raise ValueError(f"repository must be 'owner/repo', got {repository!r}")
 
             runner.hydrate()
-            if not runner.has_capacity():
-                raise ConcurrencyLimitError(
-                    f"Runner {runner.name!r} at max_concurrent="
-                    f"{runner.meta.max_concurrent}"
-                )
+            with StageClock("has_capacity"):
+                if not runner.has_capacity():
+                    raise ConcurrencyLimitError(
+                        f"Runner {runner.name!r} at max_concurrent="
+                        f"{runner.meta.max_concurrent}"
+                    )
 
             merged_labels = list(dict.fromkeys([*(labels or []), *runner.meta.labels]))
             if not merged_labels:
@@ -296,17 +298,21 @@ class Runner:
 
             use_docker = bool(exp.get("vm_runtime"))
             if image is None:
-                if runner.meta.job_image_name:
-                    image = modal.Image.from_name(
-                        runner.meta.job_image_name,
-                        environment_name=environment_name or runner.environment_name,
-                        client=client or runner.client,
-                    )
-                else:
-                    # Imperative / objects-only: build from this uv project (repo root).
-                    image = (
-                        Runner.docker_image() if use_docker else Runner.default_image()
-                    )
+                with StageClock("resolve_job_image"):
+                    if runner.meta.job_image_name:
+                        image = modal.Image.from_name(
+                            runner.meta.job_image_name,
+                            environment_name=environment_name
+                            or runner.environment_name,
+                            client=client or runner.client,
+                        )
+                    else:
+                        # Imperative / objects-only: build from this uv project.
+                        image = (
+                            Runner.docker_image()
+                            if use_docker
+                            else Runner.default_image()
+                        )
 
             vol_map: dict[
                 str | os.PathLike[str], modal.Volume | modal.CloudBucketMount
@@ -334,34 +340,39 @@ class Runner:
             run_env = dict(env or {})
             run_env.setdefault("RUNNER_ALLOW_RUNASROOT", "1")
             run_env[JOB_SPEC_ENV] = spec.model_dump_json()
+            # Forward so in-job StageClock (jit_mint) matches the Server flag.
+            profile = os.environ.get(StageClock.ENV)
+            if profile and StageClock.ENV not in run_env:
+                run_env[StageClock.ENV] = profile
 
-            sandbox = modal.Sandbox.create(
-                "python",
-                "-m",
-                JOB_MODULE,
-                app=app,
-                image=image,
-                env=run_env,
-                secrets=[secret, *(secrets or [])],
-                volumes=vol_map,
-                timeout=timeout,
-                idle_timeout=job_idle,
-                workdir=workdir,
-                gpu=gpu,
-                cloud=cloud,
-                region=job_region,
-                cpu=cpu,
-                memory=memory,
-                block_network=block_network,
-                outbound_cidr_allowlist=outbound_cidr_allowlist,
-                inbound_cidr_allowlist=inbound_cidr_allowlist,
-                proxy=proxy,
-                name=name,
-                tags=merged_tags,
-                experimental_options=exp or None,
-                environment_name=environment_name or runner.environment_name,
-                client=client or runner.client,
-            )
+            with StageClock("sandbox_create"):
+                sandbox = modal.Sandbox.create(
+                    "python",
+                    "-m",
+                    JOB_MODULE,
+                    app=app,
+                    image=image,
+                    env=run_env,
+                    secrets=[secret, *(secrets or [])],
+                    volumes=vol_map,
+                    timeout=timeout,
+                    idle_timeout=job_idle,
+                    workdir=workdir,
+                    gpu=gpu,
+                    cloud=cloud,
+                    region=job_region,
+                    cpu=cpu,
+                    memory=memory,
+                    block_network=block_network,
+                    outbound_cidr_allowlist=outbound_cidr_allowlist,
+                    inbound_cidr_allowlist=inbound_cidr_allowlist,
+                    proxy=proxy,
+                    name=name,
+                    tags=merged_tags,
+                    experimental_options=exp or None,
+                    environment_name=environment_name or runner.environment_name,
+                    client=client or runner.client,
+                )
             return cls(sandbox)
 
         @property

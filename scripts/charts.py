@@ -73,41 +73,29 @@ def chart_time_to_ready() -> Path:
 def chart_queue_budget() -> Path:
     """Breakdown of warm self-hosted queue (time to online)."""
     # Shape after Named Image + in-job JIT mint (not an SLA).
-    stages = ["Admit /\nclaim", "Sandbox\ncreate", "JIT mint\n(in job)", "Runner\nonline"]
+    stages = ["Admit / claim", "Sandbox create", "JIT mint (in job)", "Runner online"]
     shares = [5, 10, 15, 70]
     colors = ["#8a8a8a", "#5b8fc7", "#3b6ea5", "#c47a2c"]
+    y = list(range(len(stages)))[::-1]
 
-    fig, ax = plt.subplots(figsize=(7.2, 3.2))
-    left = 0.0
-    for label, share, color in zip(stages, shares, colors, strict=True):
-        ax.barh([0], [share], left=left, color=color, height=0.55, label=label)
-        if share >= 10:
-            ax.text(
-                left + share / 2,
-                0,
-                f"{share}%",
-                ha="center",
-                va="center",
-                color="white",
-                fontsize=10,
-                fontweight="bold",
-            )
-        left += share
-
+    fig, ax = plt.subplots(figsize=(7.2, 3.6))
+    bars = ax.barh(y, shares, color=colors, height=0.65)
+    ax.set_yticks(y)
+    ax.set_yticklabels(stages)
     ax.set_xlim(0, 100)
-    ax.set_yticks([])
     ax.set_xlabel("Share of warm time-to-online (%)")
     ax.set_title("Warm queue budget (self-hosted Sandbox runner)")
-    ax.legend(
-        loc="upper center",
-        ncol=4,
-        frameon=False,
-        bbox_to_anchor=(0.5, 1.22),
-        fontsize=9,
-    )
+    for bar, share in zip(bars, shares, strict=True):
+        ax.text(
+            share + 1.5,
+            bar.get_y() + bar.get_height() / 2,
+            f"{share}%",
+            ha="left",
+            va="center",
+            fontsize=10,
+        )
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
-    ax.spines["left"].set_visible(False)
     fig.tight_layout()
     path = OUT / "queue-budget.png"
     fig.savefig(path, bbox_inches="tight")

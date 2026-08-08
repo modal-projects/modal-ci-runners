@@ -14,6 +14,7 @@ from fastapi import FastAPI, HTTPException, Request, Response, status
 from pydantic import BaseModel, Field, ValidationError
 
 from runner_modal.exceptions import AuthError, ConcurrencyLimitError
+from runner_modal.profile import StageClock
 from runner_modal.runner import Runner
 
 DELIVERY_TTL_SECONDS = 7 * 24 * 3600
@@ -235,7 +236,8 @@ class WebhookApp:
         if not runner.admits(event.labels):
             return Response(status_code=status.HTTP_204_NO_CONTENT)
 
-        existing = self.deliveries.try_claim(event.delivery_id)
+        with StageClock("delivery_claim"):
+            existing = self.deliveries.try_claim(event.delivery_id)
         if existing is not None:
             if existing.status == "done" and existing.object_id:
                 return JobAccepted(object_id=existing.object_id)
@@ -246,13 +248,14 @@ class WebhookApp:
 
         job_name = f"job-{event.job_id}"
         try:
-            job = Runner.Job.create(
-                runner,
-                repository=event.repo,
-                labels=event.labels,
-                name=job_name,
-                secret=runner.github_secret(),
-            )
+            with StageClock("job_create"):
+                job = Runner.Job.create(
+                    runner,
+                    repository=event.repo,
+                    labels=event.labels,
+                    name=job_name,
+                    secret=runner.github_secret(),
+                )
         except LookupError as e:
             self.deliveries.release(event.delivery_id)
             raise HTTPException(
@@ -273,7 +276,8 @@ class WebhookApp:
             raise
 
         # Never release after a successful create — retry would double-spawn.
-        self.deliveries.mark_done(event.delivery_id, job.object_id)
+        with StageClock("delivery_mark_done"):
+            self.deliveries.mark_done(event.delivery_id, job.object_id)
         return JobAccepted(
             object_id=job.object_id,
             name=job_name,

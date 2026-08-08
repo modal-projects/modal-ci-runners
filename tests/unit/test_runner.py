@@ -148,6 +148,27 @@ def test_job_create_passes_secret_and_spec() -> None:
         assert kwargs["cpu"] == 2.0
 
 
+def test_job_create_forwards_profile_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    from runner_modal.profile import StageClock
+
+    fake_sb = MagicMock()
+    fake_sb.object_id = "sb-prof"
+    runner = Runner.from_name("p", create_if_missing=True, labels=["modal"])
+    runner.meta.job_image_name = "p-job"
+    monkeypatch.setenv(StageClock.ENV, "1")
+
+    with (
+        patch.object(runner, "hydrate"),
+        patch.object(runner, "has_capacity", return_value=True),
+        patch("runner_modal.runner.modal.Sandbox.create", return_value=fake_sb) as create,
+        patch("runner_modal.runner.modal.Image.from_name", return_value=MagicMock()),
+    ):
+        Runner.Job.create(
+            runner, repository="a/b", labels=["job-1"], secret=MagicMock()
+        )
+        assert create.call_args.kwargs["env"][StageClock.ENV] == "1"
+
+
 def test_job_create_without_image_name_builds_default() -> None:
     fake_sb = MagicMock()
     fake_sb.object_id = "sb-local"

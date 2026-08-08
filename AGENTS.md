@@ -77,3 +77,13 @@ Concise always-on rules for this repo. Prefer Modal SDK shapes, idiomatic Python
 - Free public helper functions as the primary DX
 - Path / `add_local_dir` instead of uv-native Image install
 - Substituting export/signature tests for security and race/idempotency tests
+
+## Learned User Preferences
+
+- Optimize from measured profile data only; do not infer bottlenecks. Prefer general, non-overfit changes that keep functionality — no micro-hack opts.
+- README perf content: Python-generated charts for general CI-runner metrics people care about (including vs GitHub Actions when relevant); do not overfit the README to a single profile run. Use the readme skill when revamping READMEs.
+
+## Learned Workspace Facts
+
+- Profiling / bench harness lives under `scripts/` (e.g. `scripts/profile.py`, `scripts/charts.py`), not under `examples/`.
+- This repo is a uv project; prefer `uv run modal` (or project-local Modal) over ad-hoc `uvx modal` when Modal is a dependency.

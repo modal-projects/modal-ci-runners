@@ -37,5 +37,4 @@ runner = Runner.create(
     max_concurrent=20,
     cache=True,
     idle_timeout=900,
-    env={"RUNNER_MODAL_PROFILE": "1"},
 )
